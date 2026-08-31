@@ -48,8 +48,9 @@
         <li><kbd>Click</kbd> it to toggle hands-free recording</li>
         <li><kbd>Space</kbd> works too, or just type below</li>
         <li><kbd>Conversation</kbd> keeps the mic open and takes its turns for
-            you - it pauses its ears while it speaks, so headphones feel most
-            natural. <kbd>Esc</kbd> ends it.</li>
+            you. With <kbd>Barge-in</kbd> on you can talk over the reply and it
+            stops mid-sentence; headphones feel most natural.
+            <kbd>Esc</kbd> ends it.</li>
       </ul>
     </section>
   </main>
@@ -83,6 +84,14 @@
             <path d="M12 12c1.5 2.5 3 4 5 4a4 4 0 1 0 0-8c-2 0-3.5 1.5-5 4"></path>
           </svg>
           <span>Conversation</span>
+        </button>
+        <!-- Barge-in: only meaningful while the mic is open, so it only shows
+             up then. Disabled outright if the browser gave us a microphone
+             with no echo cancellation - it would hear itself. -->
+        <button id="barge" class="ghost barge-toggle" type="button" aria-pressed="true" hidden
+                title="Barge-in: talk over the reply and it stops">
+          <span class="barge-dot" aria-hidden="true"></span>
+          <span>Barge-in</span>
         </button>
         <button id="mute" class="ghost mute" type="button" title="Mute spoken replies">Sound on</button>
       </div>

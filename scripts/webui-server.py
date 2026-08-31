@@ -147,8 +147,51 @@ class AudioStore(object):
             return self._clips.get(clip_id)
 
 
+class TurnRegistry(object):
+    """The turns currently streaming, so one can be stopped from outside.
+
+    Barge-in needs a way to say "stop that reply" from a second HTTP request
+    while the first is still inside its streaming loop. Each live turn parks a
+    threading.Event here under (sessionId, turnId); POST /api/interrupt sets
+    it, and the loop that is pulling tokens out of the language model checks it
+    between deltas and between sentences and gives up.
+    """
+
+    def __init__(self, limit=64):
+        self._turns = OrderedDict()
+        self._lock = threading.Lock()
+        self._limit = limit
+
+    def open(self, sid, turn_id):
+        stop = threading.Event()
+        with self._lock:
+            self._turns[(sid, turn_id)] = stop
+            while len(self._turns) > self._limit:
+                self._turns.popitem(last=False)
+        return stop
+
+    def close(self, sid, turn_id):
+        with self._lock:
+            self._turns.pop((sid, turn_id), None)
+
+    def interrupt(self, sid, turn_id=None):
+        """Stop one turn, or - with no turn id - whatever that session has
+        running. Returns how many were actually stopped, so the caller can tell
+        "too late, it had finished" from "stopped it"."""
+        with self._lock:
+            if turn_id:
+                found = [self._turns.get((sid, turn_id))]
+            else:
+                found = [ev for (s, _), ev in self._turns.items() if s == sid]
+        found = [ev for ev in found if ev is not None]
+        for ev in found:
+            ev.set()
+        return len(found)
+
+
 SESSIONS = SessionStore()
 AUDIO = AudioStore()
+TURNS = TurnRegistry()
 
 
 # ------------------------------------------------------------------ backends
@@ -263,6 +306,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "VoiceWebUI/1.0"
     protocol_version = "HTTP/1.1"
 
+    _dead = False        # the browser hung up mid-stream
+    _stop = None         # this turn's interrupt flag, once it has one
+
     # --- plumbing -------------------------------------------------------
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -310,11 +356,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/chat":
                 return self.api_chat()
+            if path == "/api/interrupt":
+                # Deliberately tiny and deliberately not behind the session
+                # lock: the turn being stopped is holding that lock, and this
+                # has to answer while it does.
+                body = json.loads(self._read_body() or b"{}") or {}
+                sid = body.get("sessionId")
+                turn_id = body.get("turnId")
+                if not isinstance(sid, str) or not sid:
+                    return self._json(400, {"error": "sessionId is required"})
+                if turn_id is not None and not isinstance(turn_id, str):
+                    return self._json(400, {"error": "turnId must be a string"})
+                stopped = TURNS.interrupt(sid, turn_id or None)
+                return self._json(200, {"ok": True, "sessionId": sid,
+                                        "turnId": turn_id, "stopped": stopped})
             if path == "/api/clear":
                 body = self._read_body()
                 sid = (json.loads(body or b"{}") or {}).get("sessionId")
                 if sid:
                     SESSIONS.clear(sid)
+                    TURNS.interrupt(sid)
                 return self._json(200, {"ok": True, "sessionId": sid})
         except Exception as exc:
             self.log_message("error handling %s: %s", path, exc)
@@ -343,8 +404,23 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- the chat chain -------------------------------------------------
     def _event(self, obj):
-        self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
-        self.wfile.flush()
+        """Write one SSE event, tolerating a browser that has hung up.
+
+        A barge-in aborts the fetch, so the socket can die at any point in the
+        stream. That is not an error worth unwinding the chain for - the turn
+        is over either way - so the first failed write marks the stream dead
+        and the rest go nowhere.
+        """
+        if getattr(self, "_dead", False):
+            return
+        try:
+            self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionError, OSError):
+            self._dead = True
+            if self._stop is not None:
+                # The client is gone: stop generating for it.
+                self._stop.set()
 
     def api_chat(self):
         raw = self._read_body()
@@ -364,6 +440,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "audio is not valid base64"})
 
         sid = req.get("sessionId") or uuid.uuid4().hex
+        # The page names its own turn so it can interrupt this exact one; a
+        # client that does not bother still gets an id, it just cannot aim.
+        turn_id = req.get("turnId")
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            turn_id = uuid.uuid4().hex
+        turn_id = turn_id.strip()[:64]
         session = SESSIONS.get(sid)
 
         self.send_response(200)
@@ -373,18 +455,27 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.end_headers()
 
-        self._event({"type": "session", "sessionId": sid})
+        # Registered before a single token is asked for: an interrupt that
+        # arrives while the model is still warming up must still find it.
+        self._dead = False
+        self._stop = TURNS.open(sid, turn_id)
+        self._event({"type": "session", "sessionId": sid, "turnId": turn_id})
         try:
-            self._run_chain(session, audio_b64, text)
+            self._run_chain(session, audio_b64, text, self._stop)
         except Exception as exc:
             self.log_message("chat chain failed: %s", exc)
             try:
                 self._event({"type": "error", "message": str(exc)})
             except Exception:
                 pass
+        finally:
+            TURNS.close(sid, turn_id)
+            self._stop = None
 
-    def _run_chain(self, session, audio_b64, text):
+    def _run_chain(self, session, audio_b64, text, stop=None):
         t0 = time.time()
+        if stop is None:
+            stop = threading.Event()
         tts_args = SimpleNamespace(tts_url=self.server.tts_url,
                                    max_seconds=30.0, timeout=300.0)
 
@@ -403,6 +494,11 @@ class Handler(BaseHTTPRequestHandler):
                         results.put(None)
                         return
                     index, sentence = item
+                    # The turn was cut off while this was queued: drain the
+                    # queue without troubling the speech server. Nothing more
+                    # is synthesised for a reply nobody is listening to.
+                    if stop.is_set():
+                        continue
                     started = time.time()
                     try:
                         wav = vc.speak(tts_args, sentence,
@@ -447,8 +543,16 @@ class Handler(BaseHTTPRequestHandler):
             first_token_ms = None
             failed = None
 
+            # Bound rather than inlined into the for, so it can be closed the
+            # moment we stop caring: closing the generator closes the socket to
+            # llama-server, and llama-server stops generating for a client that
+            # has gone. Otherwise a cut-off turn keeps a GPU busy writing an
+            # answer to a question nobody is waiting on any more.
+            tokens = stream_llm(self.server.llm_url, messages)
             try:
-                for piece in stream_llm(self.server.llm_url, messages):
+                for piece in tokens:
+                    if stop.is_set():
+                        break
                     if first_token_ms is None:
                         first_token_ms = int((time.time() - t0) * 1000)
                         self._event({"type": "start", "firstTokenMs": first_token_ms})
@@ -457,6 +561,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._event({"type": "delta", "text": piece})
                     sentences, buffer = vc.split_sentences(buffer)
                     for sentence in sentences:
+                        if stop.is_set():
+                            break
                         if not vc.is_speakable(sentence):
                             continue
                         index += 1
@@ -466,8 +572,14 @@ class Handler(BaseHTTPRequestHandler):
                     drain()
             except Exception as exc:
                 failed = exc
+            finally:
+                try:
+                    tokens.close()
+                except Exception:
+                    pass
 
-            if failed is None:
+            interrupted = stop.is_set()
+            if failed is None and not interrupted:
                 tail = buffer.strip()
                 if tail and vc.is_speakable(tail):
                     index += 1
@@ -481,12 +593,18 @@ class Handler(BaseHTTPRequestHandler):
             worker.join(timeout=5)
 
             reply = "".join(pieces).strip()
+            interrupted = interrupted or stop.is_set()
             if failed is not None:
                 self._event({"type": "error",
                              "message": "the language model stream failed: %s" % failed})
             elif reply:
                 session.messages.append(turn)
-                session.messages.append({"role": "assistant", "content": reply})
+                # An interrupted reply is stored as what was actually said,
+                # with an em dash where the user cut in. Storing the whole
+                # thing would make the model believe it finished a sentence
+                # nobody heard, and every later turn would be built on that.
+                stored = (reply + " \u2014") if interrupted else reply
+                session.messages.append({"role": "assistant", "content": stored})
                 del session.messages[:-MAX_HISTORY_MESSAGES]
 
             self._event({
@@ -497,7 +615,8 @@ class Handler(BaseHTTPRequestHandler):
                 "firstAudioMs": state["first_audio_ms"],
                 "llmMs": llm_ms,
                 "totalMs": int((time.time() - t0) * 1000),
-                "ok": failed is None and bool(reply),
+                "interrupted": interrupted,
+                "ok": failed is None and not interrupted and bool(reply),
             })
 
 

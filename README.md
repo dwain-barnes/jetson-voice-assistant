@@ -130,29 +130,69 @@ and are spoken as each sentence finishes.
 ### Conversation mode
 
 <!-- VIDEO: conversation-mode demo goes here. Record: click Conversation, have a natural multi-turn
-     spoken exchange (no hands), show the phase labels and per-reply timings. Upload the clip via the
-     GitHub web editor so it embeds as a player. -->
+     spoken exchange (no hands), show the phase labels and per-reply timings, and talk over one long
+     reply so the bubble is left tagged "interrupted" mid-sentence. Upload the clip via the GitHub
+     web editor so it embeds as a player. -->
 
 One click and you just talk: an adaptive voice-activity detector calibrates to your room's noise for
 a second, then watches energy levels, spots when you start and stop speaking, auto-sends each
 utterance, and plays the reply.
 
-Half-duplex by design: it pauses its ears while speaking so it doesn't hear itself through your
-speakers, then resumes listening automatically - the natural back-and-forth loop. (True barge-in -
-interrupting it mid-sentence - is the next upgrade.)
+Talk over it and it stops mid-sentence and yields. The reply is cut off where you cut it off, the
+words it never got to say are never spoken, and what you were saying while you interrupted is the
+next thing it answers.
 
 The **Conversation** button next to the mic is the hands-free path: press it once and you never touch
 the page again. The microphone stays open, a voice activity detector in the page decides where each
 thing you say begins and ends, and every finished utterance is sent on its own. The dock says which
-phase it is in - *listening to the room*, *conversation - listening*, *hearing you*, *thinking*,
-*speaking* - and the level meter turns teal to say it is your turn. **Esc**, or the button again,
-ends it.
+phase it is in - *listening to the room*, *conversation - listening*, *hearing you*, *thinking - talk
+over it*, *speaking - talk over it* - and the level meter turns teal to say it is your turn. **Esc**,
+or the button again, ends it.
 
-It is **half duplex**: while the assistant is thinking or talking it stops listening entirely, and
-only opens its ears again a quarter of a second after the last sentence has played. That is what
-stops it hearing itself through the speakers and answering its own reply. Headphones give the most
-natural feel, and are the answer if your microphone picks up your speakers - with them you can start
-talking the moment it stops. Speakers work fine, you just wait your turn.
+#### Barge-in
+
+A small **Barge-in** toggle appears beside **Conversation** while the mode is on. With it on the
+microphone is never switched off - not while the assistant is thinking, not while it is talking - and
+interrupting works the way it does with a person: you start talking, it stops.
+
+Everything is stopped, not just the sound. The audio still queued for the sentences it had written
+but not yet spoken is thrown away, the streaming request is aborted in the browser, and
+`POST /api/interrupt` tells the server to stop pulling tokens out of the language model and to stop
+feeding the speech server - a reply cut off after two sentences does not quietly synthesise the other
+fifteen. This matters more here than on a desktop: the Jetson has one GPU and a speech model that is
+not fast, so the work saved by not finishing a dead reply is work the *next* reply gets. The cut-off
+reply is marked **interrupted** in the transcript, with an em dash where it stopped, and it is stored
+in the conversation history as only what was actually said. Ask it later what it just told you and it
+answers from the truncated version, because that is the only version it has.
+
+Short replies are a different case, and worth knowing about. The model usually finishes writing long
+before the last sentence has been spoken - especially here, where the speech model is the slow half -
+so if you cut in near the end there is no stream left to abort and nothing to truncate: the sound
+stops and it yields, but the reply on screen and in its memory is the whole thing, because the whole
+thing is what it wrote. `/api/interrupt` reports `stopped: 0` in that case. Only a reply cut off
+*while it was still being written* is marked interrupted and shortened in the history.
+
+Interrupting has to cost more than starting to speak into silence, or the assistant's own voice
+coming back through the microphone would cut it off constantly. So while it holds the floor the
+detector wants roughly twice the volume (`interruptK`) and several times the persistence
+(`interruptMs`, counted net - loud windows add, quiet ones take the same back) before it believes
+you. A cough, a chair, a "mm-hm" fades back to nothing; someone actually talking crosses the line in
+about half a second. On top of that the first `echoGuardMs` of every spoken chunk is a blind spot
+while the echo canceller settles on the new sound.
+
+**Barge-in needs the browser's echo canceller.** The page asks for `echoCancellation`,
+`noiseSuppression` and `autoGainControl`, then reads back what it was actually given
+(`track.getSettings()`, also logged to the console and shown in the toggle's tooltip). If echo
+cancellation was refused, the toggle is disabled with a tooltip saying why and the mode falls back to
+half duplex, because without it the assistant reliably interrupts itself. Headphones remove the
+problem entirely. Loud speakers close to the microphone can still beat the echo canceller and make it
+talk over itself - if that happens, switch barge-in off. The choice is remembered; conversation mode
+itself still never starts by itself.
+
+With barge-in off it is **half duplex**, which is what it was before: while the assistant is thinking
+or talking it stops listening entirely, and only opens its ears again a quarter of a second after the
+last sentence has played. That stops it hearing itself and answering its own reply. Speakers work
+fine, you just wait your turn.
 
 The microphone never opens on its own. The preference is remembered, so a returning session
 highlights the button, but it still costs one click - and it needs a secure origin like any other
@@ -175,9 +215,14 @@ it uses is at the top of `webui/app.js`:
 | `prerollMs` | 300 | audio kept from *before* the start, so the first syllable survives |
 | `maxUtterMs` | 30000 | hard stop, so a stuck microphone cannot record forever |
 | `resumeDelayMs` | 250 | settle time after the reply before listening again |
+| `interruptK` | 6.4 | the bar for cutting the reply off, as `noiseFloor * k`. Kept at twice `thresholdK`, so tuning the room tunes both |
+| `interruptMs` | 250 | **net** loud audio needed to interrupt: a loud 20 ms window adds, a quiet one takes the same back. Real speech dips below any bar between syllables, so an unbroken run of this length never happens - but a bang decays to nothing while talking climbs. In practice about half a second of speech |
+| `echoGuardMs` | 300 | blind to interruptions for this long after each spoken chunk starts, while the echo canceller converges. Evidence is frozen, not erased, so someone who began talking just before the chunk did is not made to start again |
 
 Raise `thresholdK` if a noisy room keeps triggering it; raise `endMs` if it cuts you off while you
-think mid-sentence; lower it if the pause before an answer feels long.
+think mid-sentence; lower it if the pause before an answer feels long. Raise `interruptK` if the
+assistant talks over itself through loud speakers, or `interruptMs` if a passing noise keeps stopping
+it mid-reply; lower either if you have to shout to get a word in.
 
 ### The microphone needs one extra step over the LAN
 

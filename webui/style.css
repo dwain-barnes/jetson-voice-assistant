@@ -321,6 +321,45 @@ kbd {
   box-shadow: 0 10px 30px -10px var(--accent);
 }
 
+/* Barge-in sub-toggle. It only exists while conversation mode is on, and it is
+   deliberately quieter than the mode it modifies: a dot that is lit or not. */
+.barge-toggle {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 12px 6px 10px;
+  white-space: nowrap;
+}
+.barge-toggle[hidden] { display: none; }
+.barge-toggle .barge-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--faint);
+  transition: background 0.25s, box-shadow 0.25s;
+}
+.barge-toggle.active { color: #cfe9e5; border-color: rgba(53, 214, 196, 0.45); }
+.barge-toggle.active .barge-dot {
+  background: var(--accent-2);
+  box-shadow: 0 0 10px 1px rgba(53, 214, 196, 0.55);
+}
+.barge-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
+.barge-toggle:disabled:hover { color: var(--muted); background: var(--surface); }
+
+/* A reply the user talked over. The text keeps whatever had been said, with an
+   em dash where it stopped, and the tag says why it looks unfinished. */
+.turn.interrupted .bubble { border-style: dashed; }
+.cut-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  background: rgba(53, 214, 196, 0.12);
+  border: 1px solid rgba(53, 214, 196, 0.35);
+  vertical-align: 2px;
+}
+
+
 .mic {
   position: relative;
   width: 76px; height: 76px;
