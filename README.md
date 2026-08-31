@@ -129,10 +129,8 @@ and are spoken as each sentence finishes.
 
 ### Conversation mode
 
-<!-- VIDEO: conversation-mode demo goes here. Record: click Conversation, have a natural multi-turn
-     spoken exchange (no hands), show the phase labels and per-reply timings, and talk over one long
-     reply so the bubble is left tagged "interrupted" mid-sentence. Upload the clip via the GitHub
-     web editor so it embeds as a player. -->
+**[▶ Watch the demo](demo/jetson-demo.mp4)** — 30 seconds of real, unedited hands-free
+conversation with the board.
 
 One click and you just talk: an adaptive voice-activity detector calibrates to your room's noise for
 a second, then watches energy levels, spots when you start and stop speaking, auto-sends each
