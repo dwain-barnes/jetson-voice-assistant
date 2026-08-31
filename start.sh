@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Start the voice assistant: llama-server (Gemma 4 E2B, GPU) +
 # llama-tts-server (Pocket TTS, CPU by default) + the browser front end.
 #
@@ -192,7 +192,7 @@ start_drop_loop() {
 stop_drop_loop() {
     if [ -n "$DROP_LOOP_PID" ]; then
         kill "$DROP_LOOP_PID" 2>/dev/null || sudo -n kill "$DROP_LOOP_PID" 2>/dev/null || true
-        wait "$DROP_LOOP_PID" 2>/dev/null
+        wait "$DROP_LOOP_PID" 2>/dev/null || true
         DROP_LOOP_PID=""
     fi
 }
