@@ -36,7 +36,11 @@ PREBUILT_URL="https://github.com/dwain-barnes/jetson-voice-assistant/releases/do
 PREBUILT_SHA256="a0cf9b0650bdaf1d72ad93c87ac8a900c9d612f2855929a050da665c6b5a0826"
 
 LLM_REPO="unsloth/gemma-4-E2B-it-GGUF"
-LLM_QUANT="UD-Q4_K_XL"            # 2.97 GiB - see the memory budget in README
+LLM_QUANT="UD-Q2_K_XL"            # 2.24 GiB - the fast default: leaves room for
+                                  # speech on the GPU (~1.5s to first sound).
+                                  # --quant UD-Q4_K_XL gives smarter answers but
+                                  # speech must then move to the CPU: set
+                                  # ttsOnGpu false (~19s/sentence). See README.
 LLM_MMPROJ="mmproj-F16.gguf"      # 0.92 GiB; CUDA on Orin runs F16 natively
 TTS_REPO="EryriLabs/pocket-tts-GGUF"
 TTS_FILES=(pocket-tts-en.gguf mmproj-pocket-tts-en.gguf)

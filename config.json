@@ -1,13 +1,13 @@
 {
-  "_comment": "Defaults for the Jetson Orin Nano Super (8GB unified). setup.sh rewrites the paths; edit config.local.json to override anything without touching this file. contextSize 2048 is the verified-safe default on 8GB - see the memory budget in the README before raising it. ttsOnGpu is false because Pocket TTS on the GPU needs a second CUDA context (~0.6GB plus compute buffers) that does not reliably fit next to Gemma Q4 on this board.",
+  "_comment": "Defaults for the Jetson Orin Nano Super (8GB unified). setup.sh rewrites the paths; edit config.local.json to override anything without touching this file. The shipped default is the fast pair verified on hardware: Gemma at UD-Q2_K_XL plus Pocket TTS on the GPU (~1.5s to first sound). The pair matters: GPU speech needs a second CUDA context (~0.6GB plus compute buffers) that does NOT fit next to Gemma Q4 - if you raise quant to UD-Q4_K_XL for smarter answers, set ttsOnGpu to false (speech then takes ~19s/sentence on the ARM cores). contextSize 2048 is the verified-safe default on 8GB - see the memory budget in the README before raising it.",
   "llmPort": 8090,
   "ttsPort": 8100,
   "webUiPort": 8123,
-  "quant": "UD-Q4_K_XL",
+  "quant": "UD-Q2_K_XL",
   "contextSize": 2048,
   "llmGpuLayers": 99,
   "ttsThreads": 4,
-  "ttsOnGpu": false,
+  "ttsOnGpu": true,
   "ttsGpuLayers": 99,
   "modelsDir": "",
   "bin": {

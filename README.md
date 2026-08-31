@@ -222,7 +222,7 @@ That part is genuinely good. Asking it a question and reading the answer feels i
 During the load `MemFree` dives to around **80 MB**. That is alarming and it is also normal - as long
 as the page cache was dropped immediately beforehand, the load completes from there.
 
-### Pocket TTS on the ARM CPU (the shipped default)
+### Pocket TTS on the ARM CPU (the fallback for bigger quants)
 
 | | |
 |---|---|
@@ -238,20 +238,20 @@ realtime.
 The text answer still arrives in under a second, so if you read replies rather than listen to them,
 none of this matters.
 
-### Pocket TTS on the GPU
+### Pocket TTS on the GPU (the shipped default, paired with Q2)
 
 | | |
 |---|---|
 | Speed | ~30x faster than the CPU path |
-| Measured | 0.64 s to produce ~3 s of audio |
-| Fits alongside Gemma Q4 + a desktop session on 8 GB? | **No** |
+| Measured | 0.64 s to produce ~3 s of audio; ~1.5 s to first sound in the web UI |
+| Fits alongside Gemma **Q2** on 8 GB? | **Yes** - this is the shipped default |
+| Fits alongside Gemma **Q4** + a desktop session? | **No** |
 
-Fast enough for real conversation, and it does not reliably fit. A second CUDA context costs about
-0.6 GB before any compute buffers, and on an 8 GB board next to `UD-Q4_K_XL` and a desktop GUI it
-runs out during CUDA graph capture and dies.
-
-It is worth trying if you are either running a smaller quant (`UD-Q2_K_XL`, 2.24 GiB) or running the
-board headless. See [Speech on the GPU](#speech-on-the-gpu-ttsongpu).
+This is why the default quant is `UD-Q2_K_XL`: it leaves room for the second CUDA context (~0.6 GB
+before compute buffers) that GPU speech needs, and the result is a genuinely conversational
+assistant. Raise the quant to `UD-Q4_K_XL` for smarter answers and the speech server no longer fits
+on the GPU - it runs out during CUDA graph capture and dies - so set `ttsOnGpu` to `false` and
+accept the ~19 s/sentence CPU voice. See [Speech on the GPU](#speech-on-the-gpu-ttsongpu).
 
 ## The page cache trap: NvMap and MemFree
 
@@ -411,25 +411,28 @@ Everything `setup.sh` downloads, with the sizes confirmed against the Hugging Fa
 
 | File | Repo | Bytes |
 |---|---|---|
-| `gemma-4-E2B-it-UD-Q4_K_XL.gguf` (default) | [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) | 3,184,496,736 (2.97 GiB) |
-| `gemma-4-E2B-it-UD-Q2_K_XL.gguf` (`--quant UD-Q2_K_XL`) | unsloth/gemma-4-E2B-it-GGUF | 2.24 GiB |
+| `gemma-4-E2B-it-UD-Q2_K_XL.gguf` (default) | [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) | 2.24 GiB |
+| `gemma-4-E2B-it-UD-Q4_K_XL.gguf` (`--quant UD-Q4_K_XL`) | unsloth/gemma-4-E2B-it-GGUF | 3,184,496,736 (2.97 GiB) |
 | `mmproj-F16.gguf` | unsloth/gemma-4-E2B-it-GGUF | 985,654,080 |
 | `pocket-tts-en.gguf` | [EryriLabs/pocket-tts-GGUF](https://huggingface.co/EryriLabs/pocket-tts-GGUF) | 159,390,816 |
 | `mmproj-pocket-tts-en.gguf` | EryriLabs/pocket-tts-GGUF | 59,858,080 |
 | `unmute-prod-website/default_voice.wav` | [kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices) | 480,044 |
 | | **default set** | **4,389,879,756 (~4.09 GiB)** |
 
-`UD-Q2_K_XL` is the quant to reach for when something else on the board is holding ~2.4 GB. It is
-noticeably worse than Q4 at following instructions, and it is the only thing that fits.
+`UD-Q2_K_XL` is the default because it is the quant that leaves room for speech on the GPU (the
+config that makes conversation feel natural), and because it still fits when something else on the
+board is holding ~2.4 GB. `UD-Q4_K_XL` is noticeably better at following instructions - the price is
+CPU speech (~19 s/sentence).
 
 Two notes on those choices:
 
 - **F16, not BF16, for the projector.** The repo ships both at almost the same size (985 MB vs
   986 MB). Ampere handles F16 in hardware, and llama.cpp's CUDA backend is best-trodden on F16, so
   there is nothing to gain from BF16 here.
-- **Pocket TTS runs on the CPU by default**, on 4 of the 6 Cortex-A78AE cores, which keeps the entire
-  GPU for the language model. That was the right call for reliability and the wrong one for speed:
-  measured at ~0.16x realtime. See the performance section, and `ttsOnGpu` if you have the memory.
+- **Pocket TTS runs on the GPU by default** (`ttsOnGpu: true`), which is what makes replies start in
+  about a second and a half. It fits because the default quant is Q2. If you move up to Q4, set
+  `ttsOnGpu: false` - speech falls back to 4 of the 6 Cortex-A78AE cores at ~0.16x realtime. See the
+  performance section.
 
 ## Building
 
@@ -503,7 +506,7 @@ undo your settings.
   "contextSize": 2048,
   "llmGpuLayers": 99,
   "ttsThreads": 4,
-  "ttsOnGpu": false,
+  "ttsOnGpu": true,
   "ttsGpuLayers": 99
 }
 ```
@@ -512,8 +515,8 @@ undo your settings.
 |---|---|---|
 | `contextSize` | 2048 | The safe value on 8 GB. Was 4096 before hardware testing. Raise it only with headroom to spare. |
 | `llmGpuLayers` | 99 | All of them. Gemma E2B fits on the GPU; there is no reason to split it. |
-| `ttsThreads` | 4 | 6 measured identical to 4 - the CPU speech path is not thread-bound. |
-| `ttsOnGpu` | `false` | `true` is ~30x faster and usually does not fit. See above. |
+| `ttsThreads` | 4 | Only used when `ttsOnGpu` is `false`. 6 measured identical to 4 - the CPU speech path is not thread-bound. |
+| `ttsOnGpu` | `true` | ~30x faster than CPU speech. Fits because the default quant is Q2; set `false` if you raise the quant to Q4. |
 | `ttsGpuLayers` | 99 | Only used when `ttsOnGpu` is `true`. |
 
 Command line:
