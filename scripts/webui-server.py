@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Browser front end for the local voice assistant.
 
 Serves webui/ as a static site and proxies the whole chain behind one origin,
@@ -47,8 +47,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful voice assistant. The user speaks to you; some of their "
     "messages arrive as audio. Answer the person directly, talking to them as "
     "\"you\" - never narrate what the speaker said. Your reply is read out "
-    "loud, so keep it to one or two short conversational sentences unless you "
-    "are asked for more."
+    "loud. For ordinary conversation keep it to one or two short sentences. "
+    "But when the user asks for a list, a story, steps, or an explanation, "
+    "give the complete answer: every item they asked for, in full sentences, "
+    "one per line - announcing a list and then stopping is wrong."
 )
 # Gemma wants a text part alongside the audio; this is the nudge that keeps it
 # answering the speaker instead of describing the recording.
@@ -263,7 +265,7 @@ def build_messages(session, audio_b64, text):
     return messages, turn
 
 
-def stream_llm(llm_url, messages, timeout=300.0, max_tokens=256, temperature=0.7):
+def stream_llm(llm_url, messages, timeout=300.0, max_tokens=640, temperature=0.7):
     """Yield content deltas from llama-server's OpenAI-compatible SSE stream."""
     payload = {
         "model": "gemma",
