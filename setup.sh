@@ -1,16 +1,19 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # One-time setup for the Jetson Orin Nano Super voice assistant.
 #
-# Installs build dependencies, builds a patched llama.cpp for CUDA compute 8.7,
-# downloads the models, and writes config.local.json.
+# Gets the two servers - either the prebuilt JetPack 6 binaries (fast) or a
+# patched llama.cpp built here for CUDA compute 8.7 (30-60 minutes) - then
+# downloads the models and writes config.local.json.
 #
 # Safe to run more than once: anything already on disk is left alone.
 #
-#   ./setup.sh                 normal run
-#   ./setup.sh --quant Q4_K_M  pick a different LLM quant
-#   ./setup.sh --skip-build    only fetch models
-#   ./setup.sh --skip-models   only build
-#   ./setup.sh --force         re-resolve every path
+#   ./setup.sh                      normal run - offers the prebuilt binaries first
+#   ./setup.sh --quant Q4_K_M       pick a different LLM quant
+#   ./setup.sh --build-from-source  never download, always compile
+#   ./setup.sh --prebuilt           never compile, insist on the download
+#   ./setup.sh --skip-build         only fetch models
+#   ./setup.sh --skip-models        only build
+#   ./setup.sh --force              re-resolve every path
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +24,15 @@ CONFIG_LOCAL="$REPO/config.local.json"
 
 LLAMA_COMMIT="9f0d017"
 CUDA_ARCH=87                      # Orin = Ampere, compute capability 8.7
+
+# Prebuilt binaries, so that most people never have to sit through the build.
+# Built on JetPack 6 (L4T R36.4.7), CUDA arch 87, from llama.cpp at
+# $LLAMA_COMMIT with llama-tts-server.patch applied. The tarball holds
+# llama-server, llama-tts-server and the libggml*/libllama*/libmtmd shared
+# objects they need.
+RELEASE_TAG="v1.0.0"
+PREBUILT_NAME="jetson-voice-assistant-orin-jp6-cuda-arm64.tar.gz"
+PREBUILT_URL="https://github.com/dwain-barnes/jetson-voice-assistant/releases/download/$RELEASE_TAG/$PREBUILT_NAME"
 
 LLM_REPO="unsloth/gemma-4-E2B-it-GGUF"
 LLM_QUANT="UD-Q4_K_XL"            # 2.97 GiB - see the memory budget in README
@@ -33,16 +45,19 @@ VOICE_FILE="unmute-prod-website/default_voice.wav"
 SKIP_BUILD=0
 SKIP_MODELS=0
 FORCE=0
+WANT_PREBUILT=auto            # auto | always | never
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --quant)       LLM_QUANT="$2"; shift 2 ;;
-        --quant=*)     LLM_QUANT="${1#*=}"; shift ;;
-        --skip-build)  SKIP_BUILD=1; shift ;;
-        --skip-models) SKIP_MODELS=1; shift ;;
-        --force)       FORCE=1; shift ;;
-        -h|--help)     sed -n '2,13p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *)             echo "unknown option: $1" >&2; exit 2 ;;
+        --quant)             LLM_QUANT="$2"; shift 2 ;;
+        --quant=*)           LLM_QUANT="${1#*=}"; shift ;;
+        --build-from-source) WANT_PREBUILT=never; shift ;;
+        --prebuilt)          WANT_PREBUILT=always; shift ;;
+        --skip-build)        SKIP_BUILD=1; shift ;;
+        --skip-models)       SKIP_MODELS=1; shift ;;
+        --force)             FORCE=1; shift ;;
+        -h|--help)           sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)                   echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
@@ -71,9 +86,13 @@ info 'everything runs on this board; nothing is sent anywhere'
 step "Checking the board"
 
 IS_JETSON=0
+L4T_R36=0
 if [ -f /etc/nv_tegra_release ]; then
     IS_JETSON=1
     ok "$(head -n1 /etc/nv_tegra_release)"
+    # The prebuilt binaries were compiled against JetPack 6 (L4T R36). Anything
+    # older links a different CUDA runtime and will not load them.
+    if grep -q 'R36' /etc/nv_tegra_release; then L4T_R36=1; fi
 elif [ -f /proc/device-tree/model ] && tr -d '\0' < /proc/device-tree/model | grep -qi 'jetson\|orin'; then
     IS_JETSON=1
     ok "$(tr -d '\0' < /proc/device-tree/model)"
@@ -166,14 +185,83 @@ fi
 
 # ------------------------------------------------------------------- build
 
-if [ "$SKIP_BUILD" -eq 1 ]; then
-    step "Skipping the build (--skip-build)"
-elif [ "$FORCE" -eq 0 ] && [ -x "$BUILD_DIR/bin/llama-server" ] && [ -x "$BUILD_DIR/bin/llama-tts-server" ]; then
-    step "Both servers are already built"
-    ok "$BUILD_DIR/bin/llama-server"
-    ok "$BUILD_DIR/bin/llama-tts-server"
-    info "pass --force to rebuild"
-else
+# The shared objects ship next to the binaries rather than being installed, so
+# every attempt to run one needs the loader pointed at that directory. start.sh
+# exports the same thing.
+BIN_LD_PATH="$BUILD_DIR/bin"
+
+binaries_present() {
+    [ -x "$BUILD_DIR/bin/llama-server" ] && [ -x "$BUILD_DIR/bin/llama-tts-server" ]
+}
+
+# Actually run one of them. A file of the right name that cannot resolve its
+# libraries is worse than no file at all, because start.sh would accept it.
+verify_binaries() {
+    LD_LIBRARY_PATH="$BIN_LD_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$BUILD_DIR/bin/llama-server" --version >/dev/null 2>&1
+}
+
+# ---- the fast path: download what has already been built ------------------
+
+prebuilt_eligible() {
+    [ "$ARCH" = "aarch64" ] || { info "not aarch64 ($ARCH) - the prebuilt binaries would not run here" >&2; return 1; }
+    [ "$L4T_R36" -eq 1 ] || { info "no 'R36' in /etc/nv_tegra_release - built for JetPack 6, so not this board" >&2; return 1; }
+    return 0
+}
+
+try_prebuilt() {
+    local tmp tgz
+    tmp="$(mktemp -d)" || return 1
+    tgz="$tmp/$PREBUILT_NAME"
+
+    info "downloading $PREBUILT_NAME"
+    info "from $PREBUILT_URL"
+    if ! curl -fL --retry 3 --progress-bar -o "$tgz" "$PREBUILT_URL"; then
+        warn "the download failed"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    mkdir -p "$BUILD_DIR/bin"
+    if ! tar -xzf "$tgz" -C "$tmp"; then
+        warn "the tarball did not extract - it may be a truncated download"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    # Flatten whatever shape the archive has: the binaries and the .so files all
+    # have to end up side by side in build/bin.
+    local moved=0 f
+    while IFS= read -r f; do
+        if cp -f "$f" "$BUILD_DIR/bin/"; then
+            moved=$((moved + 1))
+        fi
+    done < <(find "$tmp" -type f \( -name 'llama-server' -o -name 'llama-tts-server' \
+                                    -o -name '*.so' -o -name '*.so.*' \))
+    rm -rf "$tmp"
+
+    if [ "$moved" -eq 0 ]; then
+        warn "the tarball did not contain anything recognisable"
+        return 1
+    fi
+    info "unpacked $moved files into $BUILD_DIR/bin"
+
+    chmod +x "$BUILD_DIR/bin/llama-server" "$BUILD_DIR/bin/llama-tts-server" 2>/dev/null || true
+    binaries_present || { warn "llama-server or llama-tts-server was not in the tarball"; return 1; }
+
+    if ! verify_binaries; then
+        warn "the downloaded llama-server will not run on this board"
+        info "(tried: LD_LIBRARY_PATH=$BIN_LD_PATH $BUILD_DIR/bin/llama-server --version)"
+        return 1
+    fi
+
+    ok "$(LD_LIBRARY_PATH="$BIN_LD_PATH" "$BUILD_DIR/bin/llama-server" --version 2>&1 | head -n1)"
+    return 0
+}
+
+# ---- the slow path: compile ------------------------------------------------
+
+build_from_source() {
     step "Fetching llama.cpp at $LLAMA_COMMIT"
 
     if [ ! -d "$LLAMA_DIR/.git" ]; then
@@ -221,6 +309,56 @@ else
     [ -x "$BUILD_DIR/bin/llama-server" ]     || die "llama-server was not produced"
     [ -x "$BUILD_DIR/bin/llama-tts-server" ] || die "llama-tts-server was not produced"
     ok "built both servers"
+}
+
+# ---- decide which path to take ---------------------------------------------
+
+if [ "$SKIP_BUILD" -eq 1 ]; then
+    step "Skipping the build (--skip-build)"
+elif [ "$FORCE" -eq 0 ] && binaries_present; then
+    step "Both servers are already here"
+    ok "$BUILD_DIR/bin/llama-server"
+    ok "$BUILD_DIR/bin/llama-tts-server"
+    info "pass --force to fetch or build them again"
+else
+    GOT_BINARIES=0
+
+    if [ "$WANT_PREBUILT" = "never" ]; then
+        info "building from source because you asked for it (--build-from-source)"
+    elif prebuilt_eligible; then
+        step "Prebuilt binaries are available for this board"
+        info "$PREBUILT_NAME - built on JetPack 6 (R36), CUDA arch 87,"
+        info "llama.cpp $LLAMA_COMMIT with this repo's llama-tts-server patch."
+        info "Taking them saves the 30-60 minute build. Compiling yourself is the"
+        info "honest option if you would rather not trust someone else's binaries;"
+        info "pass --build-from-source for that."
+
+        TAKE_PREBUILT=1
+        if [ "$WANT_PREBUILT" != "always" ] && [ -t 0 ]; then
+            read -r -p "    download the prebuilt binaries? [Y/n] " reply
+            case "$reply" in [Nn]*) TAKE_PREBUILT=0 ;; esac
+        fi
+
+        if [ "$TAKE_PREBUILT" -eq 1 ]; then
+            if try_prebuilt; then
+                GOT_BINARIES=1
+                ok "prebuilt binaries in place - no build needed"
+            else
+                warn "falling back to building from source"
+            fi
+        else
+            info "building from source instead"
+        fi
+    else
+        info "no prebuilt binaries for this board, so building from source"
+    fi
+
+    if [ "$GOT_BINARIES" -eq 0 ]; then
+        if [ "$WANT_PREBUILT" = "always" ]; then
+            die "--prebuilt was given but the download could not be used. See above."
+        fi
+        build_from_source
+    fi
 fi
 
 # --------------------------------------------------------------- downloads
@@ -326,9 +464,25 @@ for b in "$BUILD_DIR/bin/llama-server" "$BUILD_DIR/bin/llama-tts-server"; do
     if [ -x "$b" ]; then ok "$(basename "$b")"; else warn "missing: $b"; MISSING=1; fi
 done
 
+if [ "$MISSING" -eq 0 ] && [ "$SKIP_BUILD" -eq 0 ]; then
+    if verify_binaries; then
+        ok "llama-server runs: $(LD_LIBRARY_PATH="$BIN_LD_PATH" "$BUILD_DIR/bin/llama-server" --version 2>&1 | head -n1)"
+    else
+        warn "llama-server will not start. If these came from the prebuilt tarball,"
+        warn "re-run with --build-from-source to compile against your own CUDA."
+        MISSING=1
+    fi
+fi
+
 echo
 if [ "$MISSING" -eq 0 ]; then
     printf '  %sSetup finished.%s Start it with:  ./start.sh\n' "$C_OK" "$C_OFF"
+    echo
+    info "One thing worth knowing before you start it: on a Jetson the page cache"
+    info "has to be freed immediately before each model load, or the CUDA allocation"
+    info "fails with 'NvMapMemAllocInternalTagged error 12'. start.sh does that for"
+    info "you if it can use sudo without a password prompt. The easy way:"
+    info "    sudo -v && ./start.sh"
 else
     printf '  %sSetup is not finished%s - see the warnings above, then re-run.\n' "$C_WARN" "$C_OFF"
     exit 1

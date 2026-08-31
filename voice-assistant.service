@@ -16,6 +16,19 @@
 # Run ./setup.sh and one successful ./start.sh by hand before enabling this.
 # The first start downloads nothing but does load ~4 GB of weights, so allow a
 # couple of minutes before the UI answers.
+#
+# On a Jetson the page cache has to be freed before each CUDA model load or
+# NvMap fails the allocation ("NvMapMemAllocInternalTagged error 12") no matter
+# what MemAvailable says. ExecStartPre below does it once as root. So that
+# start.sh can also do it between the two models, give the service user a
+# sudoers drop-in:
+#
+#     echo 'CHANGEME ALL=(root) NOPASSWD: /bin/sh -c sync;\ echo\ 3\ >\ /proc/sys/vm/drop_caches' \
+#         | sudo tee /etc/sudoers.d/voice-assistant-dropcaches
+#     sudo chmod 440 /etc/sudoers.d/voice-assistant-dropcaches
+#
+# Skip that if you would rather not, and accept that only the first load gets a
+# freshly dropped cache.
 
 [Unit]
 Description=Jetson local voice assistant (Gemma 4 E2B + Pocket TTS)
@@ -26,6 +39,10 @@ Wants=network-online.target
 Type=simple
 User=CHANGEME
 WorkingDirectory=/home/CHANGEME/jetson-voice-assistant
+# The leading '+' runs this one step as root even though the service itself
+# drops to User= above. Without a freshly dropped page cache the very first
+# cudaMalloc tends to fail on a board that has been up for a while.
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 ExecStart=/home/CHANGEME/jetson-voice-assistant/start.sh
 # start.sh traps SIGTERM and shuts its three children down itself; the control
 # group kill is the backstop if that ever fails.
