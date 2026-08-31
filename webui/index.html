@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Local Voice Assistant</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#127908;</text></svg>">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="2.5" width="6" height="11" rx="3"></rect>
+          <path d="M5 11a7 7 0 0 0 14 0"></path>
+          <path d="M12 18v3.5"></path>
+        </svg>
+      </span>
+      <span class="brand-text">
+        <strong>Local Voice Assistant</strong>
+        <small>everything runs on this machine</small>
+      </span>
+    </div>
+
+    <div class="status" id="status" role="status" aria-live="polite">
+      <span class="pill" id="pill-llm"><i class="dot"></i>thinking</span>
+      <span class="pill" id="pill-tts"><i class="dot"></i>speech</span>
+      <button class="ghost" id="btn-clear" type="button" title="Start a new conversation">New chat</button>
+    </div>
+  </header>
+
+  <main class="transcript" id="transcript" aria-live="polite">
+    <section class="welcome" id="welcome">
+      <h1>Hold the mic. Ask anything.</h1>
+      <p>
+        Your voice goes to a language model running on this computer, and the
+        reply is spoken back by a local speech model - sentence by sentence, so
+        it starts talking before it has finished thinking. Nothing leaves the
+        machine.
+      </p>
+      <ul class="hints">
+        <li><kbd>Hold</kbd> the button to record, release to send</li>
+        <li><kbd>Click</kbd> it to toggle hands-free recording</li>
+        <li><kbd>Space</kbd> works too, or just type below</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="dock">
+    <div class="meter-wrap">
+      <canvas id="meter" class="meter" width="720" height="72" aria-hidden="true"></canvas>
+      <span class="meter-label" id="meter-label">ready</span>
+    </div>
+
+    <div class="controls">
+      <input id="text-input" class="text-input" type="text" autocomplete="off"
+             placeholder="or type a question and press Enter">
+      <button id="mic" class="mic" type="button" aria-label="Hold to talk">
+        <span class="mic-ring" aria-hidden="true"></span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="2.5" width="6" height="11" rx="3"></rect>
+          <path d="M5 11a7 7 0 0 0 14 0"></path>
+          <path d="M12 18v3.5"></path>
+        </svg>
+      </button>
+      <button id="mute" class="ghost mute" type="button" title="Mute spoken replies">Sound on</button>
+    </div>
+  </footer>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

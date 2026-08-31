@@ -1,0 +1,452 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 49b3380..48ea7fb 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1403,6 +1403,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
+     } else if (ex == LLAMA_EXAMPLE_TTS) {
+         params.out_file = "output.wav";
++        params.port     = 8100; // only used by llama-tts-server
+         params.sampling.penalty_repeat = 1.05f;
+         params.sampling.penalty_last_n = -1;
+     }
+@@ -3271,14 +3272,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params & params, const std::string & value) {
+             params.hostname = value;
+         }
+-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HOST"));
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_TTS}).set_env("LLAMA_ARG_HOST"));
+     add_opt(common_arg(
+         {"--port"}, "PORT",
+         string_format("port to listen (default: %d)", params.port),
+         [](common_params & params, int value) {
+             params.port = value;
+         }
+-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_TTS}).set_env("LLAMA_ARG_PORT"));
+     add_opt(common_arg(
+         {"--reuse-port"},
+         string_format("allow multiple sockets to bind to the same port (default: %s)", params.reuse_port ? "enabled" : "disabled"),
+diff --git a/tools/tts/CMakeLists.txt b/tools/tts/CMakeLists.txt
+index 0a0b573..3ccc196 100644
+--- a/tools/tts/CMakeLists.txt
++++ b/tools/tts/CMakeLists.txt
+@@ -6,3 +6,12 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
+ if(LLAMA_TOOLS_INSTALL)
+     install(TARGETS ${TARGET} RUNTIME)
+ endif()
++
++set(TARGET llama-tts-server)
++add_executable(${TARGET} tts-server.cpp)
++target_link_libraries(${TARGET} PRIVATE llama llama-common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
++
++if(LLAMA_TOOLS_INSTALL)
++    install(TARGETS ${TARGET} RUNTIME)
++endif()
+diff --git a/tools/tts/README.md b/tools/tts/README.md
+index 1b08d5e..7028130 100644
+--- a/tools/tts/README.md
++++ b/tools/tts/README.md
+@@ -17,6 +17,39 @@ Common params:
+ - `-n <number_of_frames>` limits the output length, e.g. `-n 500`. Note that how many milliseconds each frame represents varies by model
+ - Core inference params such as `-ngl`, `-b`, `-ub`, etc.
+ 
++## Server
++
++`llama-tts-server` keeps the model resident and serves it over HTTP, so a caller does not pay the load
++cost per utterance:
++
++```sh
++llama-tts-server -hf ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF --port 8100
++```
++
++Endpoints:
++- `GET /health` returns `{"status":"ok"}` once the model is loaded
++- `POST /v1/audio/speech` takes `{"input": "text to speak", "response_format": "wav", "lang": "en"}`
++  and returns the WAV bytes as `audio/wav`. Only `wav` is supported. `lang` follows `--tts-lang`.
++  Input is limited to 4096 characters. Other fields are ignored.
++- optional `"max_frames": N` limits one response the same way `-n` does, so a caller can budget the
++  output per request. Use it if the model misses the stop token and pads the output.
++- optional `"max_seconds": S` is the same cap in seconds, converted using the model's frame rate.
++  The frame rate is measured from the first completed request, so the very first one uses a
++  12.5 fps estimate.
++
++```sh
++curl http://127.0.0.1:8100/v1/audio/speech -H "Content-Type: application/json"     -d '{"input":"Hello world"}' -o out.wav
++```
++
++Requests are serialized: the server generates one utterance at a time.
++
++Per-model notes:
++- Qwen3-TTS: `--tts-speaker-file` is optional but recommended, a Base model otherwise picks a new
++  voice for every request. A request `lang` overrides `--tts-lang`.
++- Pocket TTS: `--tts-speaker-file` is **required**, the server refuses to start without one. A
++  request `lang` is ignored (the language is a property of the weights) and the response carries
++  `X-TTS-Lang-Ignored: 1` to say so.
++
+ ## Qwen3-TTS
+ 
+ Available params:
+diff --git a/tools/tts/tts-server.cpp b/tools/tts/tts-server.cpp
+new file mode 100644
+index 0000000..c19324b
+--- /dev/null
++++ b/tools/tts/tts-server.cpp
+@@ -0,0 +1,356 @@
++#include "arg.h"
++#include "common.h"
++#include "sampling.h"
++#include "log.h"
++#include "llama.h"
++#include "mtmd.h"
++#include "mtmd-helper.h"
++
++#include <cpp-httplib/httplib.h>
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <cmath>
++#include <mutex>
++#include <string>
++#include <vector>
++
++/**
++ * Please note that this is NOT a production-ready binary.
++ * It keeps one model resident and serves it over HTTP, so a caller does not pay
++ * the load cost per utterance like llama-tts does.
++ * For contributors: please keep this code simple and easy to understand.
++ */
++
++using json = nlohmann::ordered_json;
++
++static const size_t TTS_MAX_INPUT = 4096;
++
++// Fallback only. libmtmd does not expose the frame rate, so the first completed
++// request measures it (n_samples / sample_rate / n_frames) and every later
++// request uses the measured value. 12.5 fps matches the Pocket TTS pipeline's
++// own internal constant and is close enough for the first request's budget.
++static const double TTS_DEFAULT_FPS = 12.5;
++
++struct tts_server {
++    llama_context     * lctx  = nullptr;
++    mtmd_context      * mctx  = nullptr;
++    common_sampler    * smpl  = nullptr;
++    const llama_vocab * vocab = nullptr;
++
++    std::unique_ptr<mtmd_helper::gen_audio> gen;
++
++    // Base models have no speaker identity of their own: without a reference every
++    // request samples a new voice, so a reply split over several requests changes
++    // voice mid-sentence. Pocket TTS goes further and emits near-silence without
++    // one, so it is required at startup there. Loaded once, reused by every request.
++    mtmd::bitmap_ptr speaker;
++
++    mtmd_gen_audio_type type = MTMD_GEN_AUDIO_TYPE_NONE;
++    bool lang_supported = false; // false for Pocket TTS: language is baked into the weights
++
++    int32_t  n_batch   = 512;
++    int32_t  n_predict = 512;
++    int32_t  top_k     = 50;
++    float    top_p     = 1.0f;
++    uint32_t seed      = UINT32_MAX;
++
++    // measured on the first successful generation, see TTS_DEFAULT_FPS
++    double fps = TTS_DEFAULT_FPS;
++    bool   fps_measured = false;
++
++    std::mutex mtx;
++};
++
++static void print_usage(int, char ** argv) {
++    LOG("\nexample usage:\n");
++    LOG("\n    %s -m backbone.gguf -mm mmproj.gguf --port 8100", argv[0]);
++    LOG("\n    %s -hf user/model --port 8100\n", argv[0]);
++    LOG("\nnote: Pocket TTS models require --tts-speaker-file");
++    LOG("\n\nthen:\n");
++    LOG("\n    curl http://127.0.0.1:8100/v1/audio/speech -H \"Content-Type: application/json\" \\");
++    LOG("\n         -d \"{\\\"input\\\":\\\"text to speak\\\"}\" -o out.wav\n");
++    LOG("\n");
++}
++
++// caller must hold srv.mtx
++static bool tts_synthesize(tts_server & srv, const std::string & input, const std::string & lang,
++                           int32_t max_frames, std::vector<char> & out_wav, int32_t & out_rate,
++                           int & out_frames, double & out_audio_s) {
++    // the pipeline is reused across requests, so state living outside it must be
++    // dropped here or the previous utterance bleeds into this one
++    srv.gen->reset();
++    llama_memory_clear(llama_get_memory(srv.lctx), true);
++    common_sampler_reset(srv.smpl);
++
++    mtmd_helper_gen_audio_inp inp{};
++    inp.seq_id      = 0;
++    inp.prompt      = input.c_str();
++    inp.prompt_len  = input.size();
++    // Pocket TTS has one set of weights per language and ignores this field;
++    // pass nothing rather than a language it cannot honour.
++    inp.lang        = srv.lang_supported ? lang.c_str() : nullptr;
++    inp.speaker_ref = srv.speaker.get();
++    inp.top_k       = srv.top_k;
++    inp.top_p       = srv.top_p;
++    inp.seed        = srv.seed;
++    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
++
++    if (srv.gen->set_input(&inp) != 0) {
++        LOG_ERR("set_input failed\n");
++        return false;
++    }
++
++    for (;;) {
++        int32_t ret = srv.gen->step_prompt(srv.n_batch);
++        if (ret < 0) {
++            LOG_ERR("prompt processing failed\n");
++            return false;
++        }
++        if (ret == 0) {
++            break;
++        }
++    }
++
++    // note: some pipelines ignore this token and use the hidden state instead
++    auto sample_semantic_code = [&]() -> llama_token {
++        llama_token t = common_sampler_sample(srv.smpl, srv.lctx, -1);
++        common_sampler_accept(srv.smpl, t, true);
++        return t;
++    };
++
++    // runaway cap: the per-request budget can only lower the startup limit
++    const int n_max = max_frames > 0 ? std::min(max_frames, srv.n_predict) : srv.n_predict;
++
++    int n_frames = 0;
++    llama_token   sampled = sample_semantic_code();
++    const float * h_state = llama_get_embeddings_ith(srv.lctx, -1);
++
++    bool stop = false;
++    while (!stop && n_frames < n_max) {
++        const float * h_next = nullptr;
++
++        // stage 2+3: semantic --> acoustic details --> audio waveform
++        //            step_gen() runs both stages and returns new h_state for next step
++        if (srv.gen->step_gen(sampled, h_state, &h_next, &stop) != 0) {
++            LOG_ERR("step_gen failed at frame %d\n", n_frames);
++            return false;
++        }
++        if (!h_next) {
++            break; // stopped without generating a frame
++        }
++
++        n_frames++;
++        h_state = h_next;
++        sampled = sample_semantic_code();
++    }
++
++    if (!stop && n_frames >= n_max) {
++        LOG_WRN("hit the %d frame cap without an end-of-speech, output may be truncated\n", n_max);
++    }
++
++    const char * data      = nullptr;
++    size_t       data_len  = 0;
++    int64_t      n_samples = 0;
++    if (srv.gen->get_output(&out_rate, &data, &data_len, &n_samples) != 0) {
++        LOG_ERR("get_output failed\n");
++        return false;
++    }
++
++    out_wav.assign(data, data + data_len);
++    out_frames  = n_frames;
++    out_audio_s = out_rate > 0 ? (double) n_samples / out_rate : 0.0;
++
++    // derive the model's frame rate from what it actually produced, so the
++    // seconds-based budget below does not depend on the hardcoded fallback
++    if (n_frames > 0 && out_audio_s > 0.0) {
++        srv.fps          = n_frames / out_audio_s;
++        srv.fps_measured = true;
++    }
++
++    return true;
++}
++
++static void send_error(httplib::Response & res, int status, const std::string & msg) {
++    res.status = status;
++    res.set_content(json{{"error", {{"message", msg}}}}.dump(), "application/json");
++}
++
++int main(int argc, char ** argv) {
++    common_params params;
++
++    common_init();
++
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TTS, print_usage)) {
++        return 1;
++    }
++
++    mtmd_helper_log_set(common_log_default_callback, nullptr);
++
++    if (params.mmproj.path.empty()) {
++        LOG_ERR("no mmproj provided, use --mmproj\n");
++        return 1;
++    }
++
++    // always enable embd, so that we can pass hidden states to the audio generation helper
++    params.embedding = true;
++
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    auto llama_init = common_init_from_params(params);
++    llama_model * model = llama_init->model();
++
++    tts_server srv;
++    srv.lctx = llama_init->context();
++    srv.smpl = llama_init->sampler(0);
++    if (!model || !srv.lctx) {
++        LOG_ERR("failed to init model/context\n");
++        return 1;
++    }
++    srv.vocab     = llama_model_get_vocab(model);
++    srv.n_batch   = params.n_batch;
++    srv.n_predict = params.n_predict > 0 ? params.n_predict : 512;
++    srv.top_k     = params.sampling.top_k;
++    srv.top_p     = params.sampling.top_p;
++    srv.seed      = params.sampling.seed;
++
++    mtmd_context_params mtmd_params = mtmd_context_params_default();
++    mtmd_params.use_gpu = params.mmproj_use_gpu;
++    mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
++    if (!mctx) {
++        LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
++        return 1;
++    }
++
++    const mtmd_gen_audio_info info = mtmd_gen_audio_get_info(mctx.get());
++    if (info.type == MTMD_GEN_AUDIO_TYPE_NONE) {
++        LOG_ERR("mmproj does not support audio generation\n");
++        return 1;
++    }
++    srv.type = info.type;
++    // only Qwen3-TTS carries all languages in one set of weights
++    srv.lang_supported = info.type == MTMD_GEN_AUDIO_TYPE_QWEN3TTS;
++
++    srv.mctx = mctx.get();
++    srv.gen.reset(new mtmd_helper::gen_audio(srv.lctx, srv.mctx));
++
++    if (!params.tts_speaker_file.empty()) {
++        auto wrapper = mtmd_helper_bitmap_init_from_file(srv.mctx, params.tts_speaker_file.c_str(), false);
++        if (!wrapper.bitmap) {
++            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
++            return 1;
++        }
++        srv.speaker.reset(wrapper.bitmap);
++        LOG_INF("speaker reference: %s\n", params.tts_speaker_file.c_str());
++    } else if (srv.type == MTMD_GEN_AUDIO_TYPE_POCKETTTS) {
++        // Pocket TTS produces near-silence without a reference, so refuse to
++        // serve rather than answer every request with an unusable WAV
++        LOG_ERR("Pocket TTS requires a speaker reference, pass --tts-speaker-file <wav/mp3>\n");
++        return 1;
++    } else {
++        LOG_WRN("no --tts-speaker-file given: a Base model picks a new voice per request\n");
++    }
++
++    httplib::Server http;
++
++    http.Get("/health", [](const httplib::Request &, httplib::Response & res) {
++        res.set_content(json{{"status", "ok"}}.dump(), "application/json");
++    });
++
++    http.Post("/v1/audio/speech", [&srv](const httplib::Request & req, httplib::Response & res) {
++        json body;
++        try {
++            body = json::parse(req.body);
++        } catch (const std::exception & e) {
++            send_error(res, 400, std::string("invalid JSON: ") + e.what());
++            return;
++        }
++
++        if (!body.contains("input") || !body.at("input").is_string()) {
++            send_error(res, 400, "missing required string field 'input'");
++            return;
++        }
++        const std::string input = body.at("input").get<std::string>();
++        if (input.empty()) {
++            send_error(res, 400, "'input' must not be empty");
++            return;
++        }
++        if (input.size() > TTS_MAX_INPUT) {
++            send_error(res, 400, "'input' exceeds " + std::to_string(TTS_MAX_INPUT) + " characters");
++            return;
++        }
++
++        if (body.contains("response_format") && body.at("response_format").is_string()) {
++            const std::string fmt = body.at("response_format").get<std::string>();
++            if (fmt != "wav") {
++                send_error(res, 400, "only 'wav' response_format is supported");
++                return;
++            }
++        }
++
++        std::string lang = "en";
++        if (body.contains("lang") && body.at("lang").is_string()) {
++            lang = body.at("lang").get<std::string>();
++            if (!srv.lang_supported) {
++                // one model per language, so the field cannot be honoured; say so
++                // in a header instead of failing a request that is otherwise fine
++                LOG_WRN("ignoring 'lang': this model's language is fixed by its weights\n");
++                res.set_header("X-TTS-Lang-Ignored", "1");
++            }
++        }
++
++        // stops a runaway generation from padding out to the frame limit
++        int32_t max_frames = 0;
++        if (body.contains("max_frames") && body.at("max_frames").is_number_integer()) {
++            max_frames = body.at("max_frames").get<int32_t>();
++            if (max_frames <= 0) {
++                send_error(res, 400, "'max_frames' must be positive");
++                return;
++            }
++        }
++        // convenience form of the same cap, converted with the model's frame rate
++        if (body.contains("max_seconds") && body.at("max_seconds").is_number()) {
++            const double max_seconds = body.at("max_seconds").get<double>();
++            if (max_seconds <= 0.0) {
++                send_error(res, 400, "'max_seconds' must be positive");
++                return;
++            }
++            const int32_t from_seconds = (int32_t) std::ceil(max_seconds * srv.fps);
++            max_frames = max_frames > 0 ? std::min(max_frames, from_seconds) : from_seconds;
++        }
++
++        std::vector<char> wav;
++        int32_t rate    = 0;
++        int     frames  = 0;
++        double  audio_s = 0.0;
++
++        const int64_t t_start_us = ggml_time_us();
++        {
++            std::lock_guard<std::mutex> lock(srv.mtx);
++            if (!tts_synthesize(srv, input, lang, max_frames, wav, rate, frames, audio_s)) {
++                send_error(res, 500, "synthesis failed");
++                return;
++            }
++        }
++        const double t_s = (ggml_time_us() - t_start_us) / 1e6;
++
++        LOG_INF("synthesized %d frames, %zu bytes (%d Hz), audio %.2fs in %.2fs (%.2fx realtime)\n",
++                frames, wav.size(), rate, audio_s, t_s, t_s > 0 ? audio_s / t_s : 0.0);
++
++        res.set_content(wav.data(), wav.size(), "audio/wav");
++    });
++
++    LOG_INF("model: %s pipeline%s%s\n",
++            srv.type == MTMD_GEN_AUDIO_TYPE_POCKETTTS ? "Pocket TTS" : "Qwen3-TTS",
++            info.model_variant ? ", variant " : "",
++            info.model_variant ? info.model_variant : "");
++    LOG_INF("listening on http://%s:%d\n", params.hostname.c_str(), params.port);
++    if (!http.listen(params.hostname, params.port)) {
++        LOG_ERR("failed to listen on %s:%d\n", params.hostname.c_str(), params.port);
++        return 1;
++    }
++
++    llama_backend_free();
++    return 0;
++}

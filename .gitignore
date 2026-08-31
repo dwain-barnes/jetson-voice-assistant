@@ -1,0 +1,7 @@
+build/
+models/
+llama.cpp/
+logs/
+*.wav
+__pycache__/
+config.local.json

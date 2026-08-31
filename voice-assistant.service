@@ -1,0 +1,42 @@
+# Start the voice assistant on boot.
+#
+# Install (replace CHANGEME with your username, and the paths if you cloned
+# somewhere other than the home directory):
+#
+#     sed -e "s/CHANGEME/$USER/g" -e "s#/home/CHANGEME/jetson-voice-assistant#$PWD#g" \
+#         voice-assistant.service | sudo tee /etc/systemd/system/voice-assistant.service
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now voice-assistant
+#
+# Then:
+#     systemctl status voice-assistant     is it up?
+#     journalctl -u voice-assistant -f     follow the start-up output
+#     sudo systemctl stop voice-assistant  stop it
+#
+# Run ./setup.sh and one successful ./start.sh by hand before enabling this.
+# The first start downloads nothing but does load ~4 GB of weights, so allow a
+# couple of minutes before the UI answers.
+
+[Unit]
+Description=Jetson local voice assistant (Gemma 4 E2B + Pocket TTS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGEME
+WorkingDirectory=/home/CHANGEME/jetson-voice-assistant
+ExecStart=/home/CHANGEME/jetson-voice-assistant/start.sh
+# start.sh traps SIGTERM and shuts its three children down itself; the control
+# group kill is the backstop if that ever fails.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+# Loading two models into 8 GB of shared memory is not quick. Do not let
+# systemd give up on the start before llama-server has finished mmapping.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

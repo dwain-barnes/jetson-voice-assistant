@@ -1,0 +1,23 @@
+{
+  "_comment": "Defaults for the Jetson Orin Nano Super (8GB unified). setup.sh rewrites the paths; edit config.local.json to override anything without touching this file.",
+  "llmPort": 8090,
+  "ttsPort": 8100,
+  "webUiPort": 8123,
+  "quant": "UD-Q4_K_XL",
+  "contextSize": 4096,
+  "llmGpuLayers": 99,
+  "ttsThreads": 4,
+  "ttsOnCpu": true,
+  "modelsDir": "",
+  "bin": {
+    "llamaServer": "",
+    "llamaTtsServer": ""
+  },
+  "models": {
+    "llm": "",
+    "llmMmproj": "",
+    "tts": "",
+    "ttsMmproj": "",
+    "voice": ""
+  }
+}

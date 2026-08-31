@@ -1,0 +1,12 @@
+# This repo only ever runs on Linux, so LF everywhere - including for anyone
+# who clones it on Windows to read.
+* text=auto eol=lf
+
+# The patch must reach the Jetson byte-for-byte or `git apply` rejects it.
+*.patch -text
+*.png -text
+
+# Everything here is run by bash on Linux; never hand it CRLF.
+*.sh text eol=lf
+*.py text eol=lf
+*.service text eol=lf
