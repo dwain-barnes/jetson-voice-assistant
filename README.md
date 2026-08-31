@@ -185,14 +185,24 @@ Browsers only hand out microphone access on *secure origins* - https, or localho
 plain http on your LAN, so the mic button will be refused there. **Typing always works**, on any
 device, with no workaround.
 
-Three ways to get the microphone:
+Four ways to get the microphone, best first:
 
-1. **Browse from the Jetson itself.** `http://localhost:8123` counts as secure. If you have a monitor
+1. **SSH tunnel from your computer** - the recommended one, verified working, no browser settings:
+
+   ```
+   ssh -L 8123:localhost:8123 jetson@<jetson-ip>
+   ```
+
+   Leave that terminal open and browse to `http://localhost:8123` on your computer. Localhost counts
+   as secure, so the microphone (and Conversation mode) just work, and the traffic is encrypted as a
+   bonus.
+2. **Browse from the Jetson itself.** `http://localhost:8123` counts as secure. If you have a monitor
    on the board, this is the easy answer.
-2. **Tell Chrome to trust it.** Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add
-   `http://192.168.1.42:8123` (your actual URL), and restart the browser. Fine on a home network;
-   the flag is called "unsafely" for a reason, so undo it when you are done.
-3. **Put https in front of it.** A Tailscale/Caddy/nginx reverse proxy with a real certificate.
+3. **Tell Chrome to trust it.** Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add
+   `http://192.168.1.42:8123` (your actual URL), and restart the browser. In practice this flag is
+   fiddly - it must be the exact origin, the same Chrome profile, and a full relaunch - which is why
+   the tunnel is listed first. Undo it when you are done; it is called "unsafely" for a reason.
+4. **Put https in front of it.** A Tailscale/Caddy/nginx reverse proxy with a real certificate.
    Beyond the scope of this README, but it is the clean answer.
 
 There is also a terminal path that needs no browser at all:
