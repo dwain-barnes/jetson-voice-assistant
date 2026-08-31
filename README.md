@@ -1,8 +1,8 @@
-# Jetson Voice Assistant
+﻿# Jetson Voice Assistant
 
 **A voice assistant that runs entirely on a $249 Jetson Orin Nano Super. No cloud, no API keys, no account.**
 
-You talk. It hears you — not a transcript of you, the actual audio — thinks, and talks back, all on a
+You talk. It hears you â€” not a transcript of you, the actual audio â€” thinks, and talks back, all on a
 board that draws less power than a light bulb. Two GGUF models on llama.cpp:
 
 - **Gemma 4 E2B** listens and answers. It is natively multimodal, so your recording goes straight to
@@ -17,10 +17,10 @@ This is a port of [dwain-barnes/llama-tts-server](https://github.com/dwain-barne
 server are the same; the install and launch layer is what changed.
 
 > **Status: built and verified on x86, not yet on real Jetson hardware.** Everything here is checked
-> as far as a non-Jetson machine allows — the scripts parse, the patch applies to llama.cpp at the
+> as far as a non-Jetson machine allows â€” the scripts parse, the patch applies to llama.cpp at the
 > pinned commit, and every model file is confirmed to exist at the exact name and size quoted below.
 > What is *not* verified is the CUDA 8.7 build, the load times, and the tokens per second. If you run
-> it on a real Orin Nano, **please open an issue with what happened** — good or bad. First hardware
+> it on a real Orin Nano, **please open an issue with what happened** â€” good or bad. First hardware
 > report is genuinely welcome.
 
 ---
@@ -31,12 +31,12 @@ server are the same; the install and launch layer is what changed.
 |---|---|
 | Board | Jetson Orin Nano Super Developer Kit, 8 GB |
 | Software | JetPack 6.x (Ubuntu 22.04, L4T r36), CUDA 12.x |
-| Storage | 32 GB free — ~4.4 GB of models, the rest is the llama.cpp build tree |
+| Storage | 32 GB free â€” ~4.4 GB of models, the rest is the llama.cpp build tree |
 | Swap | 8 GB swap file **for the build**. See below; without it the build is likely to be OOM-killed. |
 | Power mode | 25W ("Super") profile: `sudo nvpmodel -m 2 && sudo jetson_clocks` |
 | Network | Only for setup. After that it is optional. |
 
-A microphone and speaker are optional — the usual way to use this is from a browser on your laptop
+A microphone and speaker are optional â€” the usual way to use this is from a browser on your laptop
 or phone, which uses *that* device's microphone and speakers.
 
 The 4 GB Orin Nano will not fit this. See the memory budget.
@@ -64,7 +64,7 @@ and are spoken as each sentence finishes.
 
 ### The microphone needs one extra step over the LAN
 
-Browsers only hand out microphone access on *secure origins* — https, or localhost. The Jetson serves
+Browsers only hand out microphone access on *secure origins* â€” https, or localhost. The Jetson serves
 plain http on your LAN, so the mic button will be refused there. **Typing always works**, on any
 device, with no workaround.
 
@@ -90,7 +90,7 @@ with no sound card it just writes the WAV and says nothing.
 
 ## Memory budget
 
-This is the whole design problem. The Orin Nano's 8 GB is **unified** — the GPU does not have its own
+This is the whole design problem. The Orin Nano's 8 GB is **unified** â€” the GPU does not have its own
 memory, it shares the system's. Every megabyte the language model takes is a megabyte Ubuntu does not
 have, and when it runs out there is no swapping a CUDA allocation back in; something gets killed.
 
@@ -112,14 +112,14 @@ leave over a gigabyte of that unused.
 The headroom is not slack, it is the budget for a desktop session, a browser on the board, page cache
 during model load, and the spike when Pocket TTS allocates its audio graph on the first request.
 
-If you are tight — running a desktop, or something else on the board — drop to a smaller quant:
+If you are tight â€” running a desktop, or something else on the board â€” drop to a smaller quant:
 
 ```bash
 ./setup.sh --quant UD-Q3_K_XL      # 2.72 GiB, saves ~0.25 GiB, slightly worse
 ./setup.sh --quant UD-Q2_K_XL      # 2.24 GiB, noticeably worse; last resort
 ```
 
-Or shrink the context in `config.local.json` (`contextSize`: 4096 → 2048).
+Or shrink the context in `config.local.json` (`contextSize`: 4096 â†’ 2048).
 
 Going *up* is possible if you run truly headless and accept the risk: `--quant Q5_K_M` (3.13 GiB) or
 `Q6_K` (4.19 GiB, which will not leave room for much else).
@@ -132,8 +132,8 @@ Everything `setup.sh` downloads, with the sizes confirmed against the Hugging Fa
 |---|---|---|
 | `gemma-4-E2B-it-UD-Q4_K_XL.gguf` | [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) | 3,184,496,736 |
 | `mmproj-F16.gguf` | unsloth/gemma-4-E2B-it-GGUF | 985,654,080 |
-| `pocket-tts-en.gguf` | [EryriLabs/pocket-tts-en-GGUF](https://huggingface.co/EryriLabs/pocket-tts-en-GGUF) | 159,390,816 |
-| `mmproj-pocket-tts-en.gguf` | EryriLabs/pocket-tts-en-GGUF | 59,858,080 |
+| `pocket-tts-en.gguf` | [EryriLabs/pocket-tts-GGUF](https://huggingface.co/EryriLabs/pocket-tts-GGUF) | 159,390,816 |
+| `mmproj-pocket-tts-en.gguf` | EryriLabs/pocket-tts-GGUF | 59,858,080 |
 | `unmute-prod-website/default_voice.wav` | [kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices) | 480,044 |
 | | | **4,389,879,756 (~4.09 GiB)** |
 
@@ -143,7 +143,7 @@ Two notes on those choices:
   986 MB). Ampere handles F16 in hardware, and llama.cpp's CUDA backend is best-trodden on F16, so
   there is nothing to gain from BF16 here.
 - **Pocket TTS runs on the CPU**, on 4 of the 6 Cortex-A78AE cores. It is a ~160 MB model, so this
-  is affordable, and it keeps the entire GPU for the language model — which is the resource actually
+  is affordable, and it keeps the entire GPU for the language model â€” which is the resource actually
   under pressure. Expect it to be slower than the ~5.8x realtime the x86 parent project sees; as long
   as it stays comfortably above 1x realtime, the sentence-at-a-time streaming hides it completely.
   **This ratio is the main thing that wants measuring on real hardware.** If it comes out below
@@ -168,7 +168,7 @@ are what take the time.
 
 `nvcc` can want well over a gigabyte per translation unit. Six of those at once, on a board with
 8 GB shared with everything else, is how a build gets OOM-killed at 90%. JetPack's zram helps a
-little — it compresses RAM rather than adding any — but for a CUDA build you want real swap:
+little â€” it compresses RAM rather than adding any â€” but for a CUDA build you want real swap:
 
 ```bash
 sudo fallocate -l 8G /swapfile
@@ -179,7 +179,7 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
 `setup.sh` checks for this and, if swap is thin, quietly backs the build off to `-j4`. You can
-`swapoff` afterwards — inference does not want swap, and a swapping Jetson is a slow Jetson.
+`swapoff` afterwards â€” inference does not want swap, and a swapping Jetson is a slow Jetson.
 
 ## Starting on boot
 
@@ -215,16 +215,16 @@ will not undo your settings.
 ## How it fits together
 
 ```
-browser ──WAV──> webui-server.py (8123) ──> llama-server (8090)   Gemma 4 E2B, GPU
-                        │                        │ streamed tokens
-                        │<───────────────────────┘
-                        │ one finished sentence at a time
-                        └──────────────> llama-tts-server (8100)  Pocket TTS, CPU
-browser <──SSE: text deltas + audio urls──┘
+browser â”€â”€WAVâ”€â”€> webui-server.py (8123) â”€â”€> llama-server (8090)   Gemma 4 E2B, GPU
+                        â”‚                        â”‚ streamed tokens
+                        â”‚<â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                        â”‚ one finished sentence at a time
+                        â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€> llama-tts-server (8100)  Pocket TTS, CPU
+browser <â”€â”€SSE: text deltas + audio urlsâ”€â”€â”˜
 ```
 
 `llama-tts-server` is the piece that is not in upstream llama.cpp. Upstream's `llama-tts` is a
-one-shot CLI that loads the model, speaks, and exits — useless in a conversation, where you would pay
+one-shot CLI that loads the model, speaks, and exits â€” useless in a conversation, where you would pay
 the model load on every sentence. The patch adds a server that keeps the model warm behind an
 OpenAI-compatible `/v1/audio/speech` endpoint. That is what makes sentence-by-sentence streaming
 possible at all.
@@ -238,7 +238,7 @@ spends the entire token budget on it and returns empty content, which the speech
 |---|---|
 | Build killed around 90% | Not enough swap. Add the swap file above and re-run `./setup.sh`. |
 | `nvcc: not found` | JetPack puts it in `/usr/local/cuda/bin`. `export PATH=/usr/local/cuda/bin:$PATH`. |
-| The mic button does nothing | Expected over http on the LAN — see the microphone section. Typing still works. |
+| The mic button does nothing | Expected over http on the LAN â€” see the microphone section. Typing still works. |
 | Everything is slow | `sudo nvpmodel -m 2 && sudo jetson_clocks` for the 25W profile. |
 | A server dies shortly after "READY" | Out of memory. Check `dmesg -T \| grep -i oom` and drop to a smaller quant. |
 | `port 8090 is already in use` | An earlier copy is still running: `pkill -f llama-server`. |
@@ -247,12 +247,12 @@ Logs from the last run are in `logs/`.
 
 ## Credits
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) — the runtime everything here stands on.
-- [Kyutai](https://huggingface.co/kyutai) — Pocket TTS and the reference voices (CC-BY-4.0).
-- [EryriLabs](https://huggingface.co/EryriLabs/pocket-tts-en-GGUF) — the Pocket TTS GGUF conversions.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) â€” the runtime everything here stands on.
+- [Kyutai](https://huggingface.co/kyutai) â€” Pocket TTS and the reference voices (CC-BY-4.0).
+- [EryriLabs](https://huggingface.co/EryriLabs/pocket-tts-GGUF) â€” the Pocket TTS GGUF conversions.
 - [Google DeepMind](https://huggingface.co/google) for Gemma 4, and
   [unsloth](https://huggingface.co/unsloth) for the dynamic quants.
-- [dwain-barnes/llama-tts-server](https://github.com/dwain-barnes/llama-tts-server) — the parent
+- [dwain-barnes/llama-tts-server](https://github.com/dwain-barnes/llama-tts-server) â€” the parent
   project this is ported from, where the TTS server patch and the web UI come from.
 
 MIT licensed. The models carry their own licences (Gemma Terms of Use; Pocket TTS CC-BY-4.0).

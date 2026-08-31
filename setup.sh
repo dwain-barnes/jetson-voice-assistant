@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # One-time setup for the Jetson Orin Nano Super voice assistant.
 #
 # Installs build dependencies, builds a patched llama.cpp for CUDA compute 8.7,
@@ -25,7 +25,7 @@ CUDA_ARCH=87                      # Orin = Ampere, compute capability 8.7
 LLM_REPO="unsloth/gemma-4-E2B-it-GGUF"
 LLM_QUANT="UD-Q4_K_XL"            # 2.97 GiB - see the memory budget in README
 LLM_MMPROJ="mmproj-F16.gguf"      # 0.92 GiB; CUDA on Orin runs F16 natively
-TTS_REPO="EryriLabs/pocket-tts-en-GGUF"
+TTS_REPO="EryriLabs/pocket-tts-GGUF"
 TTS_FILES=(pocket-tts-en.gguf mmproj-pocket-tts-en.gguf)
 VOICE_REPO="kyutai/tts-voices"
 VOICE_FILE="unmute-prod-website/default_voice.wav"
