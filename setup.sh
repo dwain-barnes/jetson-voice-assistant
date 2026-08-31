@@ -33,6 +33,7 @@ CUDA_ARCH=87                      # Orin = Ampere, compute capability 8.7
 RELEASE_TAG="v1.0.0"
 PREBUILT_NAME="jetson-voice-assistant-orin-jp6-cuda-arm64.tar.gz"
 PREBUILT_URL="https://github.com/dwain-barnes/jetson-voice-assistant/releases/download/$RELEASE_TAG/$PREBUILT_NAME"
+PREBUILT_SHA256="a0cf9b0650bdaf1d72ad93c87ac8a900c9d612f2855929a050da665c6b5a0826"
 
 LLM_REPO="unsloth/gemma-4-E2B-it-GGUF"
 LLM_QUANT="UD-Q4_K_XL"            # 2.97 GiB - see the memory budget in README
@@ -218,6 +219,15 @@ try_prebuilt() {
     info "from $PREBUILT_URL"
     if ! curl -fL --retry 3 --progress-bar -o "$tgz" "$PREBUILT_URL"; then
         warn "the download failed"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    # We are about to execute what we just downloaded - verify it first.
+    local got
+    got="$(sha256sum "$tgz" | awk '{print $1}')"
+    if [ "$got" != "$PREBUILT_SHA256" ]; then
+        warn "checksum mismatch (got $got) - refusing the download, will build instead"
         rm -rf "$tmp"
         return 1
     fi
