@@ -47,6 +47,9 @@
         <li><kbd>Hold</kbd> the button to record, release to send</li>
         <li><kbd>Click</kbd> it to toggle hands-free recording</li>
         <li><kbd>Space</kbd> works too, or just type below</li>
+        <li><kbd>Conversation</kbd> keeps the mic open and takes its turns for
+            you - it pauses its ears while it speaks, so headphones feel most
+            natural. <kbd>Esc</kbd> ends it.</li>
       </ul>
     </section>
   </main>
@@ -69,7 +72,20 @@
           <path d="M12 18v3.5"></path>
         </svg>
       </button>
-      <button id="mute" class="ghost mute" type="button" title="Mute spoken replies">Sound on</button>
+      <div class="dock-tools">
+        <!-- Hands-free. Deliberately the loudest control in the dock when it
+             is on, because it means the microphone is open. -->
+        <button id="conv" class="ghost conv-toggle" type="button" aria-pressed="false"
+                title="Hands-free: it listens, you just talk">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 12c-1.5-2.5-3-4-5-4a4 4 0 1 0 0 8c2 0 3.5-1.5 5-4"></path>
+            <path d="M12 12c1.5 2.5 3 4 5 4a4 4 0 1 0 0-8c-2 0-3.5 1.5-5 4"></path>
+          </svg>
+          <span>Conversation</span>
+        </button>
+        <button id="mute" class="ghost mute" type="button" title="Mute spoken replies">Sound on</button>
+      </div>
     </div>
   </footer>
 

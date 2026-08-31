@@ -127,6 +127,46 @@ costs an hour, not a day.
 Type in the box and press enter, or hold the microphone button and speak. Replies stream in as text
 and are spoken as each sentence finishes.
 
+### Conversation mode
+
+The **Conversation** button next to the mic is the hands-free path: press it once and you never touch
+the page again. The microphone stays open, a voice activity detector in the page decides where each
+thing you say begins and ends, and every finished utterance is sent on its own. The dock says which
+phase it is in - *listening to the room*, *conversation - listening*, *hearing you*, *thinking*,
+*speaking* - and the level meter turns teal to say it is your turn. **Esc**, or the button again,
+ends it.
+
+It is **half duplex**: while the assistant is thinking or talking it stops listening entirely, and
+only opens its ears again a quarter of a second after the last sentence has played. That is what
+stops it hearing itself through the speakers and answering its own reply. Headphones give the most
+natural feel, and are the answer if your microphone picks up your speakers - with them you can start
+talking the moment it stops. Speakers work fine, you just wait your turn.
+
+The microphone never opens on its own. The preference is remembered, so a returning session
+highlights the button, but it still costs one click - and it needs a secure origin like any other
+microphone access, so the LAN caveat below applies to it too.
+
+The detector is deliberately simple - rolling RMS against an adaptive noise floor - and every number
+it uses is at the top of `webui/app.js`:
+
+| constant | default | what it does |
+|---|---|---|
+| `windowMs` | 20 | length of the RMS windows the detector reasons in |
+| `calibrateMs` | 1000 | how long it listens to the room before arming |
+| `thresholdK` | 3.2 | speech is anything above `noiseFloor * k` |
+| `floorMin` | 0.004 | absolute floor, so a silent room cannot trigger on hiss |
+| `floorMax` | 0.06 | ceiling on the measured floor, so a loud room is clamped rather than going deaf |
+| `adapt` | 0.02 | how fast the floor follows the room while nothing is happening |
+| `startMs` | 120 | speech-level audio needed before it says you have started |
+| `endMs` | 700 | quiet needed before it says you have finished |
+| `minSpeechMs` | 350 | anything with less voiced audio than this is a cough, and is dropped |
+| `prerollMs` | 300 | audio kept from *before* the start, so the first syllable survives |
+| `maxUtterMs` | 30000 | hard stop, so a stuck microphone cannot record forever |
+| `resumeDelayMs` | 250 | settle time after the reply before listening again |
+
+Raise `thresholdK` if a noisy room keeps triggering it; raise `endMs` if it cuts you off while you
+think mid-sentence; lower it if the pause before an answer feels long.
+
 ### The microphone needs one extra step over the LAN
 
 Browsers only hand out microphone access on *secure origins* - https, or localhost. The Jetson serves

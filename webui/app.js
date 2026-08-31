@@ -11,6 +11,37 @@
   var SAMPLE_RATE = 24000;
   var MIN_RECORD_MS = 350;
 
+  /* ------------------------------------------- conversation mode tunables
+   *
+   * Hands-free listening. The microphone stays open, an energy VAD decides
+   * where each utterance starts and stops, and every finished one is sent on
+   * its own. Times are milliseconds; levels are linear RMS of the -1..1 float
+   * frames the capture node hands us (roughly: 0.001 is a quiet room, 0.05 is
+   * someone talking a foot from a laptop mic).
+   *
+   * These are the values that behave on a quiet desk with the browser's own
+   * noise suppression on. Edit them here - nothing below hard-codes a number.
+   */
+  var VAD = {
+    windowMs:     20,     // RMS is measured over windows this long, whatever
+                          //   block size the capture node happens to deliver
+    calibrateMs:  1000,   // listen to the room this long before arming
+    thresholdK:   3.2,    // speech when RMS climbs past noiseFloor * k
+    floorMin:     0.004,  // ...but never below this, so a near-silent room
+                          //   cannot arm the VAD on its own hiss
+    floorMax:     0.06,   // and a roaring room is clamped rather than going
+                          //   deaf: above this we stop trusting the floor
+    adapt:        0.02,   // EMA weight for following the floor while idle
+    startMs:      120,    // continuous speech-level audio that means "began"
+    endMs:        700,    // continuous quiet that means "finished"
+    minSpeechMs:  350,    // less voiced audio than this is a cough, not a turn
+    prerollMs:    300,    // audio kept from before the start, so the first
+                          //   syllable survives the startMs decision delay
+    maxUtterMs:   30000,  // hard stop: a stuck mic must not record forever
+    resumeDelayMs: 250    // settle after the reply stops before listening
+                          //   again, so the speaker's tail is not an utterance
+  };
+
   var el = {
     transcript: document.getElementById("transcript"),
     welcome: document.getElementById("welcome"),
@@ -20,6 +51,7 @@
     text: document.getElementById("text-input"),
     clear: document.getElementById("btn-clear"),
     mute: document.getElementById("mute"),
+    conv: document.getElementById("conv"),
     pillLlm: document.getElementById("pill-llm"),
     pillTts: document.getElementById("pill-tts")
   };
@@ -71,7 +103,7 @@
     return { wrap: wrap, bubble: bubble, meta: meta };
   }
 
-  function voiceTag(seconds) {
+  function voiceTag(seconds, label) {
     var span = document.createElement("span");
     span.className = "voice-tag";
     var bars = document.createElement("span");
@@ -82,7 +114,8 @@
       bars.appendChild(b);
     }
     span.appendChild(bars);
-    span.appendChild(document.createTextNode("Voice message - " + seconds.toFixed(1) + "s"));
+    span.appendChild(document.createTextNode(
+      (label || "Voice message") + " - " + seconds.toFixed(1) + "s"));
     return span;
   }
 
@@ -134,6 +167,7 @@
     audio.addEventListener("ended", next);
     audio.addEventListener("error", next);
     if (item.onStart) item.onStart();
+    if (conv.on) convPhase("speaking");
     audio.play().catch(function () { next(); });
 
     function next() {
@@ -142,6 +176,8 @@
       playing = false;
       current = null;
       pumpQueue();
+      // Nothing left to say: hands-free listening can have its ears back.
+      maybeResumeListening();
     }
   }
 
@@ -150,6 +186,7 @@
     if (current) { try { current.pause(); } catch (e) {} }
     current = null;
     playing = false;
+    maybeResumeListening();
   }
 
   /* --------------------------------------------------------- wav encoding */
@@ -205,21 +242,30 @@
     "if(ch&&ch.length){this.port.postMessage(new Float32Array(ch));}return true;}}" +
     "registerProcessor('cap',Cap);";
 
-  var mic = {
-    ctx: null, stream: null, node: null, source: null, analyser: null,
-    chunks: [], total: 0, rate: SAMPLE_RATE
-  };
+  var WORKLET_TIMEOUT_MS = 1500;   // give up on the worklet and use the fallback
 
-  function startRecording() {
-    if (state.recording || state.busy) return Promise.resolve();
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      systemNote("This browser will not give the page a microphone. Type your question instead.");
-      return Promise.resolve();
+  /* Open the microphone and hand every frame of samples to `onFrame`.
+   * Push-to-talk and hands-free listening both go through here, so the
+   * worklet/ScriptProcessor dance and the teardown live in one place.
+   * Resolves with a handle: { rate, analyser, close() }.
+   */
+  function openCapture(onFrame) {
+    var parts = { ctx: null, stream: null, node: null, source: null };
+
+    function close() {
+      if (parts.node) {
+        try { parts.node.disconnect(); parts.node.onaudioprocess = null; } catch (e) {}
+      }
+      if (parts.source) { try { parts.source.disconnect(); } catch (e) {} }
+      if (parts.stream) parts.stream.getTracks().forEach(function (t) { t.stop(); });
+      if (parts.ctx) { try { parts.ctx.close(); } catch (e) {} }
+      parts.node = parts.source = parts.stream = parts.ctx = null;
     }
-    stopPlayback();
-    state.recording = true;
-    paintMic();
-    setMeterLabel("listening", true);
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error(
+        "This browser will not give the page a microphone."));
+    }
 
     return navigator.mediaDevices.getUserMedia({
       audio: {
@@ -229,51 +275,91 @@
         autoGainControl: true
       }
     }).then(function (stream) {
-      if (!state.recording) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
-      mic.stream = stream;
+      parts.stream = stream;
       var Ctx = window.AudioContext || window.webkitAudioContext;
       var ctx;
       try { ctx = new Ctx({ sampleRate: SAMPLE_RATE }); }
       catch (e) { ctx = new Ctx(); }
-      mic.ctx = ctx;
-      mic.rate = ctx.sampleRate;
-      mic.chunks = [];
-      mic.total = 0;
+      parts.ctx = ctx;
 
-      mic.source = ctx.createMediaStreamSource(stream);
-      mic.analyser = ctx.createAnalyser();
-      mic.analyser.fftSize = 1024;
-      mic.analyser.smoothingTimeConstant = 0.6;
-      mic.source.connect(mic.analyser);
-      drawMeter();
+      parts.source = ctx.createMediaStreamSource(stream);
+      var analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.6;
+      parts.source.connect(analyser);
 
-      if (ctx.audioWorklet) {
-        var url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "text/javascript" }));
-        return ctx.audioWorklet.addModule(url).then(function () {
-          URL.revokeObjectURL(url);
-          var node = new AudioWorkletNode(ctx, "cap");
-          node.port.onmessage = function (ev) { collect(ev.data); };
-          mic.source.connect(node);
-          // Worklets need a destination to be pulled; a muted gain does it.
-          var sink = ctx.createGain();
-          sink.gain.value = 0;
-          node.connect(sink).connect(ctx.destination);
-          mic.node = node;
-        }).catch(useScriptProcessor);
+      // Worklets need a destination to be pulled; a muted gain does it.
+      function attach(node) {
+        var sink = ctx.createGain();
+        sink.gain.value = 0;
+        parts.source.connect(node);
+        node.connect(sink).connect(ctx.destination);
+        parts.node = node;
       }
-      return useScriptProcessor();
 
       function useScriptProcessor() {
         var node = ctx.createScriptProcessor(4096, 1, 1);
         node.onaudioprocess = function (ev) {
-          collect(new Float32Array(ev.inputBuffer.getChannelData(0)));
+          onFrame(new Float32Array(ev.inputBuffer.getChannelData(0)));
         };
-        var sink = ctx.createGain();
-        sink.gain.value = 0;
-        mic.source.connect(node);
-        node.connect(sink).connect(ctx.destination);
-        mic.node = node;
+        attach(node);
       }
+
+      var handle = { rate: ctx.sampleRate, analyser: analyser, close: close };
+
+      if (ctx.audioWorklet) {
+        var url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "text/javascript" }));
+        // Some builds (headless Chromium among them) neither resolve nor
+        // reject addModule. Without a deadline the microphone would simply
+        // never start and nothing would say why, so the wait is capped and the
+        // ScriptProcessor takes over.
+        return Promise.race([
+          ctx.audioWorklet.addModule(url),
+          new Promise(function (_, reject) {
+            setTimeout(function () {
+              reject(new Error("the audio worklet did not load"));
+            }, WORKLET_TIMEOUT_MS);
+          })
+        ]).then(function () {
+          URL.revokeObjectURL(url);
+          var node = new AudioWorkletNode(ctx, "cap");
+          node.port.onmessage = function (ev) { onFrame(ev.data); };
+          attach(node);
+          return handle;
+        }).catch(function () {
+          URL.revokeObjectURL(url);
+          useScriptProcessor();
+          return handle;
+        });
+      }
+      useScriptProcessor();
+      return handle;
+    }).catch(function (err) {
+      close();
+      throw err;
+    });
+  }
+
+  var mic = {
+    handle: null, analyser: null,
+    chunks: [], total: 0, rate: SAMPLE_RATE
+  };
+
+  function startRecording() {
+    if (state.recording || state.busy) return Promise.resolve();
+    stopPlayback();
+    state.recording = true;
+    mic.chunks = [];
+    mic.total = 0;
+    paintMic();
+    setMeterLabel("listening", true);
+
+    return openCapture(collect).then(function (handle) {
+      if (!state.recording) { handle.close(); return; }
+      mic.handle = handle;
+      mic.analyser = handle.analyser;
+      mic.rate = handle.rate;
+      drawMeter();
     }).catch(function (err) {
       state.recording = false;
       paintMic();
@@ -289,12 +375,9 @@
   }
 
   function teardownMic() {
-    if (mic.node) { try { mic.node.disconnect(); mic.node.onaudioprocess = null; } catch (e) {} }
-    if (mic.source) { try { mic.source.disconnect(); } catch (e) {} }
-    if (mic.stream) mic.stream.getTracks().forEach(function (t) { t.stop(); });
-    if (mic.ctx) { try { mic.ctx.close(); } catch (e) {} }
-    mic.node = mic.source = mic.stream = mic.analyser = null;
-    mic.ctx = null;
+    if (mic.handle) mic.handle.close();
+    mic.handle = null;
+    mic.analyser = null;
   }
 
   function stopRecording(send) {
@@ -317,6 +400,278 @@
     send_(toBase64(wav), null, total / rate);
   }
 
+  /* ----------------------------------------------------- conversation mode */
+
+  /* The VAD proper: a state machine fed one RMS window at a time.
+   *
+   *   calibrate --(calibrateMs of room tone)---> idle
+   *   idle      --(startMs above threshold)----> speech    emits "start"
+   *   speech    --(endMs below threshold, or maxUtterMs)--> idle
+   *                                             emits "end", or "tooshort"
+   *                                             if too little of it was voiced
+   *
+   * It holds no audio and touches no DOM, so a test can drive it with made-up
+   * numbers and no microphone - see window.__voiceTest at the end of the file.
+   */
+  function makeVad(cfg) {
+    var c = cfg || VAD;
+    var s = {
+      phase: "calibrate",
+      floor: 0,          // measured room tone
+      threshold: 0,      // floor * k, clamped
+      calMs: 0, calSum: 0, calN: 0,
+      loudMs: 0,         // run of above-threshold windows while idle
+      quietMs: 0,        // run of below-threshold windows while speaking
+      utterMs: 0,        // wall time since speech started
+      voicedMs: 0        // of which was actually above threshold
+    };
+
+    function retune() {
+      s.threshold = Math.max(c.floorMin, Math.min(s.floor, c.floorMax) * c.thresholdK);
+    }
+
+    function push(rms, ms) {
+      if (s.phase === "calibrate") {
+        s.calSum += rms;
+        s.calN += 1;
+        s.calMs += ms;
+        if (s.calMs < c.calibrateMs) return null;
+        s.floor = s.calN ? s.calSum / s.calN : 0;
+        retune();
+        s.phase = "idle";
+        return "calibrated";
+      }
+
+      var loud = rms > s.threshold;
+
+      if (s.phase === "idle") {
+        if (!loud) {
+          s.loudMs = 0;
+          // Follow the room while nothing is happening, so a fan spinning up
+          // does not become a permanent false positive.
+          s.floor = s.floor * (1 - c.adapt) + rms * c.adapt;
+          retune();
+          return null;
+        }
+        s.loudMs += ms;
+        if (s.loudMs < c.startMs) return null;
+        s.phase = "speech";
+        s.utterMs = s.voicedMs = s.loudMs;
+        s.loudMs = s.quietMs = 0;
+        return "start";
+      }
+
+      s.utterMs += ms;
+      if (loud) { s.voicedMs += ms; s.quietMs = 0; }
+      else { s.quietMs += ms; }
+
+      if (s.quietMs < c.endMs && s.utterMs < c.maxUtterMs) return null;
+      var enough = s.voicedMs >= c.minSpeechMs;
+      s.phase = "idle";
+      s.loudMs = s.quietMs = 0;
+      return enough ? "end" : "tooshort";
+    }
+
+    // `recalibrate` throws the measured floor away and listens to the room
+    // again; without it the floor survives and only the counters are cleared.
+    function reset(recalibrate) {
+      s.loudMs = s.quietMs = s.utterMs = s.voicedMs = 0;
+      if (recalibrate) {
+        s.phase = "calibrate";
+        s.calMs = s.calSum = s.calN = 0;
+      } else if (s.phase !== "calibrate") {
+        s.phase = "idle";
+      }
+    }
+
+    return { state: s, push: push, reset: reset };
+  }
+
+  var CONV_LABELS = {
+    calibrating: "listening to the room",
+    listening:   "conversation - listening",
+    hearing:     "hearing you",
+    thinking:    "thinking",
+    speaking:    "speaking"
+  };
+
+  var conv = {
+    on: false,
+    phase: "off",        // off | calibrating | listening | hearing | thinking | speaking
+    vad: null,
+    handle: null,
+    rate: SAMPLE_RATE,
+    ring: [], ringN: 0,     // pre-roll: the last prerollMs+startMs of frames
+    utter: [], utterN: 0,   // the utterance being captured
+    capturing: false,
+    suspended: false,       // half-duplex: deaf while the assistant talks
+    winSum: 0, winN: 0      // part-built RMS window, carried between frames
+  };
+
+  var resumeTimer = null;
+
+  function resetCapture() {
+    conv.ring = []; conv.ringN = 0;
+    conv.utter = []; conv.utterN = 0;
+    conv.capturing = false;
+  }
+
+  function convPhase(phase) {
+    conv.phase = phase;
+    paintMeterLabel();
+    paintConv();
+  }
+
+  /* Every captured frame in conversation mode passes through here: it feeds
+   * the pre-roll ring (or the utterance), and grinds the samples into
+   * fixed-length RMS windows so the VAD's timing does not depend on whether we
+   * got 128-sample worklet quanta or 4096-sample ScriptProcessor blocks. */
+  function convFrame(frame) {
+    if (!conv.on || conv.suspended) return;
+    var rate = conv.rate || SAMPLE_RATE;
+
+    if (conv.capturing) {
+      conv.utter.push(frame);
+      conv.utterN += frame.length;
+    } else {
+      conv.ring.push(frame);
+      conv.ringN += frame.length;
+      // Keep enough run-up to cover the pre-roll plus the startMs it takes to
+      // decide someone is talking.
+      var keep = Math.round(rate * (VAD.prerollMs + VAD.startMs) / 1000);
+      while (conv.ring.length > 1 && conv.ringN - conv.ring[0].length >= keep) {
+        conv.ringN -= conv.ring.shift().length;
+      }
+    }
+
+    var per = Math.max(1, Math.round(rate * VAD.windowMs / 1000));
+    for (var i = 0; i < frame.length; i++) {
+      conv.winSum += frame[i] * frame[i];
+      conv.winN += 1;
+      if (conv.winN < per) continue;
+      var rms = Math.sqrt(conv.winSum / conv.winN);
+      var ms = conv.winN * 1000 / rate;
+      conv.winSum = 0;
+      conv.winN = 0;
+      onVadEvent(conv.vad.push(rms, ms));
+      if (!conv.on || conv.suspended) return;   // the event ended the turn
+    }
+  }
+
+  function onVadEvent(ev) {
+    if (!ev) return;
+    if (ev === "calibrated") {
+      convPhase("listening");
+    } else if (ev === "start") {
+      // The ring holds the run-up, including the syllable that triggered us.
+      conv.utter = conv.ring;
+      conv.utterN = conv.ringN;
+      conv.ring = []; conv.ringN = 0;
+      conv.capturing = true;
+      convPhase("hearing");
+    } else if (ev === "end") {
+      var chunks = conv.utter, total = conv.utterN, rate = conv.rate;
+      resetCapture();
+      suspendListening();
+      convPhase("thinking");
+      send_(toBase64(encodeWav(chunks, total, rate)), null, total / rate, true);
+    } else if (ev === "tooshort") {
+      resetCapture();
+      convPhase("listening");
+    }
+  }
+
+  function suspendListening() {
+    clearTimeout(resumeTimer);
+    conv.suspended = true;
+    resetCapture();
+    conv.winSum = 0; conv.winN = 0;
+    if (conv.vad) conv.vad.reset(false);
+  }
+
+  function resumeListening() {
+    if (!conv.on) return;
+    conv.suspended = false;
+    resetCapture();
+    conv.winSum = 0; conv.winN = 0;
+    conv.vad.reset(false);
+    convPhase(conv.vad.state.phase === "calibrate" ? "calibrating" : "listening");
+  }
+
+  /* Called from everywhere a turn can end - the stream finishing, the last
+   * sentence playing out, muting, clearing. Listening only comes back when the
+   * assistant has both stopped writing and stopped talking. */
+  function maybeResumeListening() {
+    if (!conv.on || !conv.suspended) return;
+    if (state.busy || playing || playQueue.length) return;
+    clearTimeout(resumeTimer);
+    resumeTimer = setTimeout(function () {
+      if (conv.on && conv.suspended && !state.busy && !playing && !playQueue.length) {
+        resumeListening();
+      }
+    }, VAD.resumeDelayMs);
+  }
+
+  function enterConversation() {
+    if (conv.on) return;
+    if (state.recording) stopRecording(false);
+    conv.on = true;
+    conv.vad = makeVad(VAD);
+    resetCapture();
+    conv.suspended = false;
+    conv.winSum = 0; conv.winN = 0;
+    convPhase("calibrating");
+    paintMic();
+
+    openCapture(convFrame).then(function (handle) {
+      if (!conv.on) { handle.close(); return; }
+      conv.handle = handle;
+      conv.rate = handle.rate;
+      drawMeter();
+      // Entered mid-reply: stay deaf until it has finished speaking.
+      if (state.busy || playing || playQueue.length) {
+        suspendListening();
+        convPhase(state.busy ? "thinking" : "speaking");
+      }
+    }).catch(function (err) {
+      exitConversation();
+      // Do not remember a mode that could not start.
+      localStorage.setItem("va.conversation", "0");
+      systemNote("The microphone is not available: " +
+                 (err && err.message ? err.message : err));
+    });
+  }
+
+  function exitConversation() {
+    if (!conv.on) return;
+    conv.on = false;
+    conv.suspended = false;
+    clearTimeout(resumeTimer);
+    if (conv.handle) conv.handle.close();
+    conv.handle = null;
+    conv.vad = null;
+    resetCapture();
+    conv.winSum = 0; conv.winN = 0;
+    convPhase("off");
+    paintMic();
+  }
+
+  function toggleConversation() {
+    if (conv.on) exitConversation(); else enterConversation();
+    // Remembered, but never acted on at load: the mic must cost one click.
+    localStorage.setItem("va.conversation", conv.on ? "1" : "0");
+    el.conv.classList.remove("remembered");
+  }
+
+  function paintConv() {
+    el.conv.classList.toggle("active", conv.on);
+    el.conv.classList.toggle("hearing", conv.on && conv.phase === "hearing");
+    el.conv.setAttribute("aria-pressed", conv.on ? "true" : "false");
+    el.conv.title = conv.on
+      ? "Hands-free: " + (CONV_LABELS[conv.phase] || "on") + " (Esc to stop)"
+      : "Hands-free: it listens, you just talk";
+  }
+
   /* ---------------------------------------------------------- level meter */
 
   var meterCtx = el.meter.getContext("2d");
@@ -337,9 +692,15 @@
     el.meterLabel.classList.toggle("live", !!live);
   }
 
+  // Whichever capture is open owns the meter: push-to-talk or hands-free.
+  function activeAnalyser() {
+    if (conv.on && conv.handle) return conv.handle.analyser;
+    return state.recording ? mic.analyser : null;
+  }
+
   function drawMeter() {
     cancelAnimationFrame(meterRaf);
-    var data = mic.analyser ? new Uint8Array(mic.analyser.fftSize) : null;
+    var data = null;
 
     (function frame() {
       meterRaf = requestAnimationFrame(frame);
@@ -351,13 +712,40 @@
       var mid = h / 2;
       var grad = meterCtx.createLinearGradient(0, 0, w, 0);
 
-      if (state.recording && mic.analyser) {
-        mic.analyser.getByteTimeDomainData(data);
+      var analyser = activeAnalyser();
+      var live = !!analyser && (state.recording || (conv.on && !conv.suspended));
+      if (live) {
+        if (!data || data.length !== analyser.fftSize) {
+          data = new Uint8Array(analyser.fftSize);
+        }
+        analyser.getByteTimeDomainData(data);
+      } else {
+        idlePhase += 0.035;
+      }
+
+      // Conversation mode gets its own palette, so a glance at the dock says
+      // which of the two ways of talking is switched on, and which phase of
+      // the loop it is in.
+      if (conv.on) {
+        if (conv.phase === "hearing") {
+          grad.addColorStop(0, "rgba(53,214,196,0.95)");
+          grad.addColorStop(0.5, "rgba(139,123,255,0.95)");
+          grad.addColorStop(1, "rgba(53,214,196,0.95)");
+        } else if (live) {                          // listening / calibrating
+          grad.addColorStop(0, "rgba(53,214,196,0.55)");
+          grad.addColorStop(1, "rgba(74,222,128,0.55)");
+        } else if (conv.phase === "speaking") {
+          grad.addColorStop(0, "rgba(139,123,255,0.60)");
+          grad.addColorStop(1, "rgba(139,123,255,0.28)");
+        } else {                                    // thinking
+          grad.addColorStop(0, "rgba(139,123,255,0.26)");
+          grad.addColorStop(1, "rgba(53,214,196,0.26)");
+        }
+      } else if (live) {
         grad.addColorStop(0, "rgba(139,123,255,0.85)");
         grad.addColorStop(0.5, "rgba(255,107,129,0.95)");
         grad.addColorStop(1, "rgba(53,214,196,0.85)");
       } else {
-        idlePhase += 0.035;
         grad.addColorStop(0, "rgba(139,123,255,0.30)");
         grad.addColorStop(1, "rgba(53,214,196,0.30)");
       }
@@ -366,7 +754,7 @@
       var step = w / bars;
       for (var i = 0; i < bars; i++) {
         var level;
-        if (state.recording && data) {
+        if (live && data) {
           var from = Math.floor(i * data.length / bars);
           var to = Math.floor((i + 1) * data.length / bars);
           var peak = 0;
@@ -396,14 +784,18 @@
 
   /* ------------------------------------------------------------- the chain */
 
-  function send_(audioB64, text, seconds) {
+  function send_(audioB64, text, seconds, spoken) {
     if (state.busy) return;
     state.busy = true;
     paintMic();
 
     var userTurn = addTurn("user");
-    if (audioB64) userTurn.bubble.appendChild(voiceTag(seconds || 0));
-    else userTurn.bubble.textContent = text;
+    if (audioB64) {
+      userTurn.bubble.appendChild(
+        voiceTag(seconds || 0, spoken ? "Spoken" : "Voice message"));
+    } else {
+      userTurn.bubble.textContent = text;
+    }
 
     var reply = addTurn("assistant");
     var thinking = document.createElement("span");
@@ -474,6 +866,9 @@
       state.busy = false;
       paintMic();
       scroll();
+      // Nothing more to write; if nothing is queued to speak either, hands-free
+      // listening resumes from here rather than waiting on an audio element.
+      maybeResumeListening();
     }
   }
 
@@ -523,8 +918,22 @@
   function paintMic() {
     el.mic.classList.toggle("recording", state.recording);
     el.mic.classList.toggle("busy", state.busy && !state.recording);
-    el.mic.disabled = state.busy && !state.recording;
-    el.mic.setAttribute("aria-label", state.recording ? "Stop recording" : "Hold to talk");
+    // Push-to-talk stands down while hands-free has the microphone: two
+    // captures of the same device is one too many.
+    el.mic.disabled = conv.on || (state.busy && !state.recording);
+    el.mic.setAttribute("aria-label",
+      conv.on ? "Conversation mode is listening" :
+      state.recording ? "Stop recording" : "Hold to talk");
+    paintMeterLabel();
+  }
+
+  function paintMeterLabel() {
+    el.meterLabel.classList.toggle("conv", conv.on);
+    if (conv.on) {
+      setMeterLabel(CONV_LABELS[conv.phase] || "conversation",
+                    conv.phase === "hearing");
+      return;
+    }
     if (state.recording) setMeterLabel("listening", true);
     else setMeterLabel(state.busy ? "thinking" : "ready", false);
   }
@@ -533,7 +942,7 @@
   var pressStart = 0;
 
   el.mic.addEventListener("pointerdown", function (ev) {
-    if (state.busy) return;
+    if (state.busy || conv.on) return;
     ev.preventDefault();
     el.mic.setPointerCapture && el.mic.setPointerCapture(ev.pointerId);
     if (state.recording) { stopRecording(true); return; }   // toggle off
@@ -561,6 +970,7 @@
   document.addEventListener("keydown", function (ev) {
     if (ev.code !== "Space" || ev.repeat) return;
     if (document.activeElement === el.text) return;
+    if (conv.on) return;                 // hands-free already has the mic
     ev.preventDefault();
     if (state.recording) { stopRecording(true); return; }
     if (state.busy) return;
@@ -595,14 +1005,53 @@
     state.muted = !state.muted;
     el.mute.textContent = state.muted ? "Sound off" : "Sound on";
     if (state.muted) stopPlayback();
+    else maybeResumeListening();
+  });
+
+  el.conv.addEventListener("click", toggleConversation);
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Escape" || !conv.on) return;
+    exitConversation();
+    localStorage.setItem("va.conversation", "0");
   });
 
   window.addEventListener("resize", sizeMeter);
-  window.addEventListener("beforeunload", teardownMic);
+  window.addEventListener("beforeunload", function () {
+    teardownMic();
+    exitConversation();
+  });
 
   sizeMeter();
   drawMeter();
   setMeterLabel("ready", false);
+  paintConv();
+  // The preference is remembered, but the microphone never opens by itself:
+  // all a remembered "on" earns is a hint on the button.
+  if (localStorage.getItem("va.conversation") === "1") {
+    el.conv.classList.add("remembered");
+    el.conv.title = "Conversation mode was on last time - click to start listening";
+  }
   pollHealth();
   setInterval(pollHealth, 10000);
+
+  /* Exposed for tests, not for the page: drive the VAD with synthetic RMS
+   * windows and no microphone, and read back which phase the mode is in. */
+  window.__voiceTest = {
+    makeVad: makeVad,
+    vadConfig: VAD,
+    conversation: function () {
+      return {
+        on: conv.on,
+        phase: conv.phase,
+        suspended: conv.suspended,
+        capturing: conv.capturing,
+        vad: conv.vad ? {
+          phase: conv.vad.state.phase,
+          floor: conv.vad.state.floor,
+          threshold: conv.vad.state.threshold
+        } : null
+      };
+    }
+  };
 })();
