@@ -129,6 +129,18 @@ and are spoken as each sentence finishes.
 
 ### Conversation mode
 
+<!-- VIDEO: conversation-mode demo goes here. Record: click Conversation, have a natural multi-turn
+     spoken exchange (no hands), show the phase labels and per-reply timings. Upload the clip via the
+     GitHub web editor so it embeds as a player. -->
+
+One click and you just talk: an adaptive voice-activity detector calibrates to your room's noise for
+a second, then watches energy levels, spots when you start and stop speaking, auto-sends each
+utterance, and plays the reply.
+
+Half-duplex by design: it pauses its ears while speaking so it doesn't hear itself through your
+speakers, then resumes listening automatically - the natural back-and-forth loop. (True barge-in -
+interrupting it mid-sentence - is the next upgrade.)
+
 The **Conversation** button next to the mic is the hands-free path: press it once and you never touch
 the page again. The microphone stays open, a voice activity detector in the page decides where each
 thing you say begins and ends, and every finished utterance is sent on its own. The dock says which
