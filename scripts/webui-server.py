@@ -20,15 +20,18 @@ Standard library only.
 
 import argparse
 import base64
+import http.client
 import importlib.util
 import json
 import mimetypes
 import os
 import queue
+import socket
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
@@ -64,6 +67,40 @@ MAX_AUDIO_TURNS = 2
 MAX_AUDIO_CLIPS = 96          # served /api/audio/<id> blobs kept in memory
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
+# What an old spoken turn looks like in the context once its audio has been
+# dropped and nobody wrote down what was said.
+SPOKEN_PLACEHOLDER = "(the user's earlier spoken message)"
+
+# ------------------------------------------------- writing down spoken turns
+#
+# There is no speech-to-text anywhere in this chain and there is not about to
+# be: the model hears the audio itself, which is the whole point. But that
+# leaves the page showing "Spoken - 2.1s" where the words should be, and leaves
+# the history holding a placeholder once a turn's audio has aged out.
+#
+# So after the reply is finished - never before, never in its way - the same
+# model is asked one extra question: what did that clip say? The answer is
+# pushed down the same stream as a `transcript` event and swapped into the
+# stored turn. It is display and memory only; the reply the user heard was
+# produced from the audio and is already on screen by the time this runs.
+#
+# The conversation always wins. If a newer turn has started by the time this is
+# about to be sent, it is not sent; if one starts while it is in flight, the
+# connection is closed under it and the GPU goes back to the person talking.
+# That matters more here than on a desktop card: the Orin has one small GPU and
+# llama-server runs it a request at a time, so a transcript still generating is
+# a transcript standing in the next question's way. Set this to False to switch
+# the whole thing off - the chip simply stays.
+TRANSCRIBE_SPOKEN = True
+TRANSCRIBE_PROMPT = (
+    "Transcribe the speech in this audio exactly, word for word. Output only "
+    "the spoken words, nothing else."
+)
+TRANSCRIBE_MAX_TOKENS = 96
+TRANSCRIBE_TIMEOUT = 60.0     # network timeout on the transcription request
+TRANSCRIBE_WAIT = 25.0        # how long the stream is held open waiting for it
+TRANSCRIBE_MAX_CHARS = 600    # a runaway answer is not a transcript
+
 
 def _load_voice_chat():
     """Import scripts/voice-chat.py (the dash keeps it out of normal imports)."""
@@ -98,11 +135,105 @@ def load_config():
 
 # ------------------------------------------------------------- conversations
 
+class Cancellable(object):
+    """Somewhere for a background job to park the connection it is using.
+
+    Whoever supersedes the job reaches in and hangs up. Closing the socket is
+    what actually frees the language model: it stops generating for a client
+    that has gone, so the next real question is not queued behind an answer
+    nobody is waiting for any more.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._conn = None
+        self._sock = None
+        self.cancelled = False
+
+    def attach(self, conn):
+        """Hand over the connection, already dialled. Raises if the job was
+        cancelled in the moment between the check and the dial.
+
+        The socket is taken now rather than at cancel time because http.client
+        lets go of it as soon as it decides the response will close the
+        connection - and by then the only thing still holding it is the reader
+        we are trying to interrupt.
+        """
+        with self._lock:
+            if self.cancelled:
+                raise Cancelled()
+            self._conn = conn
+            self._sock = getattr(conn, "sock", None)
+
+    def cancel(self):
+        with self._lock:
+            self.cancelled = True
+            conn, self._conn = self._conn, None
+            sock, self._sock = self._sock, None
+        # shutdown() before close(): the thread doing the reading is sitting in
+        # recv() on this socket, and closing a socket out from under a blocked
+        # reader does not reliably wake it. Shutting the connection down does,
+        # which is the difference between the model being freed now and being
+        # freed whenever it happens to finish.
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+class Cancelled(Exception):
+    """The job was superseded before it could finish. Not an error."""
+
+
 class Session(object):
     def __init__(self):
         self.messages = []          # OpenAI-style, audio kept inline
         self.lock = threading.Lock()
         self.touched = time.time()
+
+        # `lock` is held for the whole of a turn's chain, so it is no use for
+        # asking "has a newer turn started?" from inside one. This second,
+        # deliberately tiny lock is: it is never held across anything that
+        # waits, so a request that has only just arrived can raise its hand
+        # while the previous turn is still streaming.
+        self.seq_lock = threading.Lock()
+        self.seq = 0                # turns started, ever
+        self.pending = None         # the Cancellable of the running after-work
+
+    def begin_turn(self):
+        """Claim the session for a new turn, and evict the last one's
+        housekeeping. Returns this turn's sequence number."""
+        with self.seq_lock:
+            self.seq += 1
+            seq = self.seq
+            pending, self.pending = self.pending, None
+        if pending is not None:
+            pending.cancel()
+        return seq
+
+    def is_current(self, seq):
+        with self.seq_lock:
+            return seq == self.seq
+
+    def claim_after_work(self, seq):
+        """A handle for work that belongs to turn `seq`, or None if that turn
+        has already been overtaken and the work should never start."""
+        with self.seq_lock:
+            if seq != self.seq:
+                return None
+            self.pending = Cancellable()
+            return self.pending
+
+    def release_after_work(self, handle):
+        with self.seq_lock:
+            if self.pending is handle:
+                self.pending = None
 
 
 class SessionStore(object):
@@ -125,7 +256,12 @@ class SessionStore(object):
 
     def clear(self, sid):
         with self._lock:
-            self._sessions.pop(sid, None)
+            gone = self._sessions.pop(sid, None)
+        # A forgotten conversation has nothing left worth writing down, and the
+        # card is better spent on whatever is asked next.
+        if gone is not None:
+            gone.begin_turn()
+        return gone
 
 
 class AudioStore(object):
@@ -255,14 +391,37 @@ def build_messages(session, audio_b64, text):
             keeps_audio = any(c.get("type") == "input_audio" for c in msg["content"])
             if keeps_audio and audio_budget <= 0:
                 stripped = [c for c in msg["content"] if c.get("type") != "input_audio"]
-                stripped.append({"type": "text",
-                                 "text": "(the user's earlier spoken message)"})
+                # Only stand a placeholder in for the audio if nothing else in
+                # the turn says what was said. A turn that has since been
+                # written down carries the real words here, and losing them to
+                # "(the user's earlier spoken message)" would be a step
+                # backwards - that placeholder exists because there was nothing
+                # better, not because it is wanted.
+                if not spoken_text(stripped):
+                    stripped.append({"type": "text", "text": SPOKEN_PLACEHOLDER})
                 msg = {"role": "user", "content": stripped}
             elif keeps_audio:
                 audio_budget -= 1
         messages.insert(1, msg)
     messages.append(turn)
     return messages, turn
+
+
+def spoken_text(content):
+    """What a spoken turn's text parts actually say, if anything.
+
+    The nudge that goes out alongside the audio is not a record of what the
+    user said, and neither is the placeholder that replaces vanished audio, so
+    neither counts.
+    """
+    said = []
+    for part in content:
+        if part.get("type") != "text":
+            continue
+        text = (part.get("text") or "").strip()
+        if text and text != AUDIO_PROMPT and text != SPOKEN_PLACEHOLDER:
+            said.append(text)
+    return " ".join(said)
 
 
 def stream_llm(llm_url, messages, timeout=300.0, max_tokens=640, temperature=0.7):
@@ -300,6 +459,89 @@ def stream_llm(llm_url, messages, timeout=300.0, max_tokens=640, temperature=0.7
                     yield piece
     finally:
         resp.close()
+
+
+def transcribe_audio(llm_url, audio_b64, handle=None, timeout=TRANSCRIBE_TIMEOUT):
+    """Ask the model to write down what one clip of audio says.
+
+    Streamed, even though nobody watches these tokens arrive. A streamed
+    request hands the connection back before the answer exists, which is the
+    only way to be able to hang up on it: with a plain request the socket does
+    not come back until the model has finished, by which time the GPU time we
+    wanted to give back has already been spent. `handle` is where the caller
+    parks that connection so a newer turn can close it.
+
+    Raw http.client rather than urllib for the same reason - urlopen() keeps
+    the connection to itself until the response headers land.
+    """
+    payload = {
+        "model": "gemma",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": TRANSCRIBE_PROMPT},
+                {"type": "input_audio",
+                 "input_audio": {"data": audio_b64, "format": "wav"}},
+            ],
+        }],
+        "temperature": 0.0,
+        "max_tokens": TRANSCRIBE_MAX_TOKENS,
+        "stream": True,
+    }
+    parts = urllib.parse.urlsplit(llm_url)
+    opener = (http.client.HTTPSConnection if parts.scheme == "https"
+              else http.client.HTTPConnection)
+    conn = opener(parts.hostname, parts.port, timeout=timeout)
+    try:
+        # Dial first, then hand the live connection over: a handle holding a
+        # socket that does not exist yet cannot hang up on anything.
+        conn.connect()
+        if handle is not None:
+            handle.attach(conn)
+        conn.request("POST", (parts.path.rstrip("/")) + "/v1/chat/completions",
+                     body=json.dumps(payload).encode("utf-8"),
+                     headers={"Content-Type": "application/json",
+                              "Accept": "text/event-stream"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise RuntimeError("llama-server answered %d" % resp.status)
+        pieces = []
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if chunk == "[DONE]":
+                break
+            try:
+                obj = json.loads(chunk)
+            except ValueError:
+                continue
+            for choice in obj.get("choices", []):
+                piece = (choice.get("delta") or {}).get("content")
+                if piece:
+                    pieces.append(piece)
+        return clean_transcript("".join(pieces))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def clean_transcript(text):
+    """Tidy the model's answer without rewriting it.
+
+    Whitespace, a pair of quotation marks it decided to add, a runaway that is
+    plainly no longer a transcript. Nothing else: the words are the point, and
+    a transcript that quietly edits what someone said is worse than none.
+    """
+    text = " ".join((text or "").split())
+    while len(text) > 1 and text[0] == text[-1] and text[0] in "\"'“”":
+        text = text[1:-1].strip()
+    if text.startswith("“") and text.endswith("”"):
+        text = text[1:-1].strip()
+    return text[:TRANSCRIBE_MAX_CHARS].strip()
 
 
 # --------------------------------------------------------------- http server
@@ -449,6 +691,10 @@ class Handler(BaseHTTPRequestHandler):
             turn_id = uuid.uuid4().hex
         turn_id = turn_id.strip()[:64]
         session = SESSIONS.get(sid)
+        # Claimed before a single event goes out: from here on this is the turn
+        # the session belongs to, and any after-the-fact work the previous turn
+        # left running is told so and hung up on.
+        seq = session.begin_turn()
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -463,7 +709,7 @@ class Handler(BaseHTTPRequestHandler):
         self._stop = TURNS.open(sid, turn_id)
         self._event({"type": "session", "sessionId": sid, "turnId": turn_id})
         try:
-            self._run_chain(session, audio_b64, text, self._stop)
+            self._run_chain(session, audio_b64, text, self._stop, seq, turn_id)
         except Exception as exc:
             self.log_message("chat chain failed: %s", exc)
             try:
@@ -474,7 +720,8 @@ class Handler(BaseHTTPRequestHandler):
             TURNS.close(sid, turn_id)
             self._stop = None
 
-    def _run_chain(self, session, audio_b64, text, stop=None):
+    def _run_chain(self, session, audio_b64, text, stop=None, seq=0,
+                   turn_id=None):
         t0 = time.time()
         if stop is None:
             stop = threading.Event()
@@ -596,10 +843,12 @@ class Handler(BaseHTTPRequestHandler):
 
             reply = "".join(pieces).strip()
             interrupted = interrupted or stop.is_set()
+            stored_turn = None
             if failed is not None:
                 self._event({"type": "error",
                              "message": "the language model stream failed: %s" % failed})
             elif reply:
+                stored_turn = turn
                 session.messages.append(turn)
                 # An interrupted reply is stored as what was actually said,
                 # with an em dash where the user cut in. Storing the whole
@@ -620,6 +869,87 @@ class Handler(BaseHTTPRequestHandler):
                 "interrupted": interrupted,
                 "ok": failed is None and not interrupted and bool(reply),
             })
+
+        # Out of the session lock, and after the answer has been given: only
+        # now is it anybody's business what the words were. An interrupted turn
+        # gets nothing - the user was already talking again when it died, and
+        # whatever they were saying is the turn that matters.
+        if (TRANSCRIBE_SPOKEN and audio_b64 and stored_turn is not None
+                and not interrupted and not self._dead):
+            self._transcribe_turn(session, seq, turn_id, audio_b64, stored_turn)
+
+    def _transcribe_turn(self, session, seq, turn_id, audio_b64, stored_turn):
+        """Write down what the user said, if the conversation lets us.
+
+        The asking happens on a worker thread so that no part of it can be
+        holding the session lock while it waits on the language model; this
+        thread does nothing but hold the stream open for the answer, and gives
+        up on it well before anyone would notice a page that never finished.
+        """
+        handle = session.claim_after_work(seq)
+        if handle is None:
+            return                      # a newer turn already has the session
+        result = {}
+        finished = threading.Event()
+
+        def work():
+            said = None
+            try:
+                if session.is_current(seq):
+                    said = transcribe_audio(self.server.llm_url, audio_b64, handle)
+                if said and (handle.cancelled or not session.is_current(seq)):
+                    said = None         # the conversation moved on while we asked
+            except Cancelled:
+                said = None
+            except Exception as exc:
+                said = None
+                # Silent as far as the page is concerned: a transcript that did
+                # not arrive leaves the chip exactly as it was, which is the
+                # honest thing for it to look like.
+                if not handle.cancelled:
+                    self.log_message("transcription failed: %s", exc)
+            session.release_after_work(handle)
+            if said:
+                result["text"] = said
+            finished.set()
+            # Deliberately after the page has been told. The swap wants the
+            # session lock, and a turn that started in the meantime holds it for
+            # as long as it streams - the words on screen must not wait on that.
+            if said:
+                adopt_transcript(session, stored_turn, said)
+
+        threading.Thread(target=work, daemon=True).start()
+        finished.wait(TRANSCRIBE_WAIT)
+        said = result.get("text")
+        if said and not self._dead:
+            self._event({"type": "transcript", "turnId": turn_id, "text": said})
+
+
+def adopt_transcript(session, turn, text):
+    """Put the words where the nudge was.
+
+    The turn keeps its audio - while it is still young enough to be resent the
+    model should hear it, not read it - but its text part stops being the
+    generic "listen to this" and becomes what was actually said. That is the
+    whole point: when the audio ages out of the window the words stay behind,
+    so the model remembers a question rather than the fact that one was asked.
+    """
+    if turn is None:
+        return False
+    with session.lock:
+        # It can have been trimmed out of the history while we were asking;
+        # identity, not position, says whether it is still there.
+        if not any(msg is turn for msg in session.messages):
+            return False
+        content = turn.get("content")
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if part.get("type") == "text":
+                part["text"] = text
+                return True
+        content.insert(0, {"type": "text", "text": text})
+        return True
 
 
 def main(argv=None):

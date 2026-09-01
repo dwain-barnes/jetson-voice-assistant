@@ -209,6 +209,33 @@ kbd {
   width: 2.5px; border-radius: 2px; background: currentColor; opacity: 0.85;
 }
 
+/* The same bubble once the model has written down what was in it: the words
+ * take the space and the chip becomes a caption under them. The bubble's own
+ * height is animated in JS, from measured to measured; this only fades the new
+ * contents in on top of that, so the two never fight. */
+/* An animation rather than a class the script toggles on the next frame: the
+ * resting state is then "visible", and a tab that was in the background when
+ * the transcript landed - where requestAnimationFrame does not run - comes
+ * back to the words rather than to an empty bubble. */
+.spoken-swap { animation: spoken-in 220ms ease; }
+@keyframes spoken-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: none; }
+}
+.spoken-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.spoken-note {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 7px;
+  font-size: 11.5px;
+  letter-spacing: 0.2px;
+  opacity: 0.62;
+}
+.spoken-note svg { width: 12px; height: 12px; flex: none; stroke-width: 2.2; }
+
+@media (prefers-reduced-motion: reduce) {
+  .spoken-swap { animation: none; }
+}
+
 .meta {
   margin: 6px 4px 0;
   font-size: 11.5px;

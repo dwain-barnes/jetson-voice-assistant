@@ -127,6 +127,34 @@ costs an hour, not a day.
 Type in the box and press enter, or hold the microphone button and speak. Replies stream in as text
 and are spoken as each sentence finishes.
 
+### What you said, written down
+
+There is no speech-to-text in this chain and there is not going to be - Gemma listens to your audio
+and answers it, which is the whole point, and a Whisper sitting next to it would want memory this
+board does not have spare. So a spoken turn appears in the transcript as a chip: a waveform, and
+*Spoken - 2.7s*. Once the reply is finished, the same model is asked one extra question - what did
+that clip say? - and the chip turns into the words, with a small microphone and the duration left
+underneath so it is still visibly something you said out loud. The words are also written back into
+the conversation history, in place of the placeholder that used to stand in for a spoken turn, so
+when the audio ages out of the context window the model remembers the question rather than the fact
+that one was asked.
+
+On this board that takes a few seconds, not the fifth of a second it takes on a desktop card. The
+words turn up well after you have finished reading the answer, and in a hands-free conversation they
+will often turn up while you are already listening to the next one. That is what it looks like when
+it is working.
+
+Nothing waits for it. The request goes out *after* the reply is done, never before and never
+alongside, so the answer you hear is not delayed by a single millisecond. And the conversation always
+wins: if you have started your next turn by the time it would be sent, it is not sent, and if you
+start one while it is in flight, the connection is closed under it and the GPU goes straight back to
+you. That matters more here than on a desktop - one GPU, and llama-server takes one request at a
+time, so a transcript still generating is a transcript standing in your next question's way.
+Rapid-fire talking therefore costs you the transcripts, not the speed: the chip simply stays as it
+was, which is honest, because nobody wrote those words down. The same is true of a reply you cut off
+mid-sentence, and of any transcription that fails - it is logged and forgotten. Set
+`TRANSCRIBE_SPOKEN = False` at the top of `scripts/webui-server.py` to turn the whole thing off.
+
 ### Conversation mode
 
 **[▶ Watch the demo](demo/jetson-demo.mp4)** — 30 seconds of real, unedited hands-free

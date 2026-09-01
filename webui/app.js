@@ -99,6 +99,10 @@
   // with the server), its AbortController, and the bubble it is writing into.
   var active = null;
 
+  // Transcripts that have landed, newest last. Only the tests read this; the
+  // page itself patches the bubble and forgets.
+  var transcripts = [];
+
   function randomId() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "");
     return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -149,6 +153,90 @@
     span.appendChild(document.createTextNode(
       (label || "Voice message") + " - " + seconds.toFixed(1) + "s"));
     return span;
+  }
+
+  /* The one icon this file draws itself. Every other icon on the page is
+   * inline in index.html; this one belongs to a bubble that only exists after
+   * a transcript arrives, so there is nothing in the markup to clone. */
+  function micIcon() {
+    var ns = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    var p = document.createElementNS(ns, "path");
+    p.setAttribute("d", "M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"
+                        + "M5 11a7 7 0 0 0 14 0M12 18v3");
+    svg.appendChild(p);
+    return svg;
+  }
+
+  /* A spoken turn's chip, once the server has sent back what was in it.
+   *
+   * There is no speech-to-text in the chain - the model listens to the audio
+   * and answers it - so until the reply is finished all the page honestly
+   * knows about a spoken turn is that it happened and how long it took. When
+   * the words do arrive they take the bubble, and the chip is demoted rather
+   * than thrown away: a mic and the duration stay underneath, so a glance
+   * still says this was said out loud rather than typed.
+   *
+   * The height is animated from what it was to what it becomes. A bubble that
+   * jumps from one line to five in a single frame drags everything below it,
+   * and the reply below it is usually the thing being read at the time.
+   */
+  function morphSpokenBubble(turn, seconds, text, label) {
+    var bubble = turn && turn.bubble;
+    if (!bubble || bubble.dataset.transcribed === "1" || !text) return;
+    bubble.dataset.transcribed = "1";
+
+    var stuck = atBottom();
+    var before = bubble.getBoundingClientRect().height;
+
+    var swap = document.createElement("div");
+    swap.className = "spoken-swap";
+
+    var words = document.createElement("div");
+    words.className = "spoken-text";
+    words.textContent = text;
+    swap.appendChild(words);
+
+    var note = document.createElement("div");
+    note.className = "spoken-note";
+    note.appendChild(micIcon());
+    note.appendChild(document.createTextNode(
+      (label || "Spoken") + " - " + (seconds || 0).toFixed(1) + "s"));
+    swap.appendChild(note);
+
+    bubble.textContent = "";
+    bubble.appendChild(swap);
+    var after = bubble.getBoundingClientRect().height;
+
+    // Detached (a "New chat" while the transcript was in flight) measures zero
+    // both times, and there is nothing to animate.
+    if (Math.abs(after - before) > 1) {
+      bubble.style.overflow = "hidden";
+      bubble.style.height = before + "px";
+      void bubble.offsetHeight;             // make the browser believe that
+      bubble.style.transition = "height 220ms cubic-bezier(.2,.7,.3,1)";
+      bubble.style.height = after + "px";
+      setTimeout(function () {
+        bubble.style.transition = "";
+        bubble.style.height = "";
+        bubble.style.overflow = "";
+        scroll(stuck);
+      }, 240);
+    }
+    // The fade is a CSS animation, and a tab in the background freezes those on
+    // their first frame - which is the invisible one. It thaws when the tab is
+    // looked at again, but "the words are there unless something stopped the
+    // animation" is not a good enough promise for the words. Timers do keep
+    // running, so one of those takes the animation away shortly afterwards and
+    // the bubble falls back to simply being visible.
+    setTimeout(function () { swap.style.animation = "none"; }, 400);
+    scroll(stuck);
   }
 
   function systemNote(text) {
@@ -1070,9 +1158,9 @@
     }
 
     var userTurn = addTurn("user");
+    var spokenLabel = spoken ? "Spoken" : "Voice message";
     if (audioB64) {
-      userTurn.bubble.appendChild(
-        voiceTag(seconds || 0, spoken ? "Spoken" : "Voice message"));
+      userTurn.bubble.appendChild(voiceTag(seconds || 0, spokenLabel));
     } else {
       userTurn.bubble.textContent = text;
     }
@@ -1087,6 +1175,7 @@
     caret.className = "caret";
     var textNode = document.createTextNode("");
     var firstTokenMs = null;
+    var doneAt = 0;
     var spoke = false;
 
     // The turn gets an id the server also knows, so /api/interrupt can name
@@ -1156,10 +1245,23 @@
         beginText();
         systemNote(ev.message);
       } else if (ev.type === "done") {
+        // The turn is over as far as the user is concerned - but the stream is
+        // not: a spoken turn may still have its words to come, so nothing here
+        // closes the reader.
+        doneAt = Date.now();
         finish();
         if (ev.text) textNode.nodeValue = ev.text;
         stampMeta(reply.meta, ev.firstTokenMs, ev.firstAudioMs, ev.totalMs);
         if (!ev.text) reply.bubble.textContent = "(no reply)";
+      } else if (ev.type === "transcript") {
+        // Addressed by id rather than by "the turn on screen": in conversation
+        // mode this can land several exchanges later, with two more bubbles
+        // under it. The closure already holds the right one - the id is what
+        // proves it.
+        if (ev.turnId && ev.turnId !== mine.id) return;
+        morphSpokenBubble(userTurn, seconds, ev.text, spokenLabel);
+        transcripts.push({ turnId: mine.id, text: ev.text,
+                           afterDoneMs: doneAt ? Date.now() - doneAt : null });
       }
     }
 
@@ -1349,6 +1451,7 @@
   window.__voiceTest = {
     makeVad: makeVad,
     vadConfig: VAD,
+    transcripts: transcripts,
     conversation: function () {
       return {
         on: conv.on,
